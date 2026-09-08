@@ -21,8 +21,18 @@ repo renders.
     GLM_DIR=/path/to/glm-5.3-flash python3 -m unittest \\
         tests.serve.test_glm_upstream -t .
 
-Only a `chat_template.jinja` is needed; no weights. Skips if the template is
-not on disk.
+Only a `chat_template.jinja` is needed; no weights. The template is looked
+up in this order:
+
+    1. $GLM_DIR, if set — a GLM release directory
+    2. tests/serve/glm_upstream/ — the vendored upstream template (the
+       default; see that directory's README.md for provenance)
+
+So the default path needs nothing on disk beyond this repo. Without it the
+suite skips, loudly; with CI_GLM_ORACLE_STRICT=1 the designated CI oracle
+job runs it instead, and a missing template, missing jinja2, or unresolved
+markers is a failure rather than a skip — that job must never be green
+because it did nothing.
 """
 
 import json
@@ -41,10 +51,13 @@ from serve.chatfmt import ChatFormat                         # noqa: E402
 from tests.serve.fake_engine import FakeEngine               # noqa: E402
 from tests.serve.test_glmtools import GLM_MARKERS, TOOLS     # noqa: E402
 
-GLM_DIR = os.environ.get("GLM_DIR",
-                         os.path.join(os.path.expanduser("~"),
-                                      "models", "glm53.waste"))
+VENDORED_DIR = REPO / "tests" / "serve" / "glm_upstream"
+GLM_DIR = os.environ.get("GLM_DIR", str(VENDORED_DIR))
 GLM_CHAT = REPO / "examples" / "chat-glm53.json"
+
+# The designated CI oracle job sets this: skips become failures, so a green
+# run means the three checks below actually executed.
+STRICT = os.environ.get("CI_GLM_ORACLE_STRICT") == "1"
 
 TOOL_CALL_ARGS = {"city": "Rome", "days": 3}
 
@@ -74,32 +87,50 @@ def render_upstream(template, messages, tools):
         messages=messages, tools=tools, add_generation_prompt=True)
 
 
+def _skip_or_fail(reason):
+    """Skip in local development, fail in the strict CI oracle job."""
+    if STRICT:
+        raise AssertionError(f"CI_GLM_ORACLE_STRICT: {reason}")
+    raise unittest.SkipTest(reason)
+
+
 class TestAgainstGlmTemplate(unittest.TestCase):
+    n_ran = 0
+
     @classmethod
     def setUpClass(cls):
         try:
             import jinja2                                     # noqa: F401
         except ImportError:
-            raise unittest.SkipTest(
-                "jinja2 not installed; the template cannot be rendered")
+            _skip_or_fail("jinja2 not installed; the template cannot be "
+                          "rendered (pip install -r requirements-test.txt)")
         cls.template = load_template()
         if not cls.template:
-            raise unittest.SkipTest(
-                f"no chat_template.jinja at {GLM_DIR} (set GLM_DIR to a "
-                "GLM release directory)")
+            _skip_or_fail(f"no chat_template.jinja at {GLM_DIR} (set GLM_DIR "
+                          "to a GLM release directory)")
         cls._tmp = tempfile.mkdtemp()
         shutil.copyfile(GLM_CHAT, os.path.join(cls._tmp, "chat.json"))
         eng = FakeEngine(no_markers=True, model_path=cls._tmp,
                          markers=dict(GLM_MARKERS))
         cls.fmt = ChatFormat.load(eng)
         if cls.fmt.tool_protocol != "glm":
-            raise unittest.SkipTest(
+            _skip_or_fail(
                 "the GLM tool markers did not resolve; there is nothing "
                 "to compare against the template")
 
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(getattr(cls, "_tmp", ""), ignore_errors=True)
+        # Strict is a promise about what ran, not merely what passed: if a
+        # registration mistake left a check out of the class, a green job
+        # would quietly cover one fewer oracle.
+        if STRICT:
+            assert cls.n_ran == 3, (
+                f"strict oracle ran {cls.n_ran} of 3 checks; the rest "
+                "never executed")
+
+    def tearDown(self):
+        TestAgainstGlmTemplate.n_ran += 1
 
     def render_ours(self, messages, tools=None):
         segs = self.fmt.build_chat_segments(messages, tools=tools,

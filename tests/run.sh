@@ -2169,7 +2169,10 @@ fi
 # grammar (`<tool_call>`, `<arg_key>`, `<arg_value>`) is that template's, not
 # anything this repo owns. Same rule — diff the rendering against it. Needs
 # the loopcontrols extension too, because the template uses `{% break %}`.
-GLM_SRC="${GLM_DIR:-$HOME/models/glm53.waste}"
+# A copy of the upstream template is vendored at tests/serve/glm_upstream/
+# (see its README.md for provenance), so this runs out of a fresh clone;
+# GLM_DIR still points a real release directory over it if one is present.
+GLM_SRC="${GLM_DIR:-tests/serve/glm_upstream}"
 if [ ! -f "$GLM_SRC/chat_template.jinja" ] && [ ! -f "$GLM_SRC/tokenizer_config.json" ]; then
     sk "chat.json tools vs GLM's chat_template" \
        "no template at $GLM_SRC (set GLM_DIR; only chat_template.jinja is needed)"
