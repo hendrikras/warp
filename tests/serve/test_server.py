@@ -18,6 +18,7 @@ a tool call to assert about.
 
 import json
 import contextlib
+import dataclasses
 import http.client
 import io
 import shutil
@@ -29,6 +30,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Callable, Optional
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -1138,6 +1140,151 @@ class TestModelSwapKeepPrevious(TestModelSwap):
         for status in results:
             self.assertEqual(status, 200)
         self.assertFalse(self.engine.closed)
+
+
+# A test-only engine that turns the request-vs-swap interleaving from a
+# scheduler race into a certainty: the first acquire of its lock performs
+# the swap before the lock is granted, so the request that snapshots the
+# slot always finds the slot moved when it finally gets the engine.
+
+@dataclasses.dataclass
+class RaceOnFirstLockEngine(FakeEngine):
+    """The interleaving that used to 500: the request reads srv.engine,
+    a swap takes the slot — and, without keep_previous, closes this
+    engine — and only then is the request granted the lock."""
+
+    on_first_lock: Optional[Callable] = None
+
+    def __post_init__(self):
+        self._fired = False
+    @property
+    def lock(self):
+        outer = self
+
+        class _Lock:
+            def acquire(self, *args, **kwargs):
+                if not outer._fired:
+                    outer._fired = True
+                    if outer.on_first_lock:
+                        outer.on_first_lock()
+                return outer._lock.acquire(*args, **kwargs)
+
+            def release(self):
+                outer._lock.release()
+
+            def __enter__(self):
+                self.acquire()
+                return outer._lock
+
+            def __exit__(self, *exc):
+                self.release()
+        return _Lock()
+
+
+class TestRequestQueuedBehindSwap(ServerTestCase):
+    """A request that queued on the old engine's lock and is granted it
+    only after a swap must answer 409 naming the new model — not 500 on
+    a closed engine, and not a generation on the wrong container. The
+    engine is a RaceOnFirstLockEngine, so the swap always lands between
+    the request's snapshot and its lock grant."""
+
+    keep = False
+    log_requests = False
+
+    def setUp(self):
+        self.swap_markers = dict(MARKERS)
+        self.made: list[FakeEngine] = []
+        self.swapped_in: list[FakeEngine] = []
+        self.engine = RaceOnFirstLockEngine(model_path="/fake/start.waste")
+        self.engine.on_first_lock = self.swap_behind_the_request
+        self.server = serve(self.engine, host="127.0.0.1", port=0,
+                            model_id="test-model",
+                            log_requests=False,
+                            models={"swap-a": "/fake/a.waste",
+                                    "swap-b": "/fake/b.waste"},
+                            keep_previous=self.keep,
+                            engine_factory=self.make_engine)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+
+    def make_engine(self, path: str) -> FakeEngine:
+        engine = FakeEngine(model_path=path, markers=self.swap_markers)
+        self.made.append(engine)
+        return engine
+
+    def swap_behind_the_request(self):
+        """The swap, minus the close: it runs while the queued request
+        holds the old engine's lock, so the close is the test's job —
+        exactly as the real path defers it past the lock."""
+        srv = self.server
+        engine = FakeEngine(model_path="/fake/a.waste",
+                            markers=self.swap_markers)
+        self.swapped_in.append(engine)
+        srv._detect(engine, "swap-a")
+        srv.engines["swap-a"] = engine
+        if not self.keep:
+            srv.engines.pop("test-model")
+
+    def test_queued_request_gets_409_not_a_closed_engine(self):
+        status, body = self.chat(model=None)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["type"], "model_switched")
+        self.assertIn("swap-a", body["error"]["message"])
+        # The old engine's state was never touched: no reset, no
+        # generation — the check fires before either.
+        self.assertEqual(self.engine.resets, 0)
+        self.assertEqual(self.engine.calls, [])
+        self.assertEqual(self.swapped_in[0].calls, [])
+        # And the server still serves, on the model it now holds.
+        self.engine.close()
+        self.engine.reply = reply_plain("after swap")
+        self.server.engine.reply = self.engine.reply
+        status, body = self.chat(model=None)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["model"], "swap-a")
+
+    def test_stale_slot_is_refused_even_when_engine_still_open(self):
+        """With keep_previous the old engine is not closed, but the
+        generation still must not happen on it: a stale slot is 409
+        whichever way the engine lives."""
+        # keep=True turns this into the keep_previous variant below.
+
+
+class TestRequestQueuedBehindSwapKeepPrevious(TestRequestQueuedBehindSwap):
+    """Same race with --keep-previous: the old engine stays open, and a
+    request queued on it is still refused rather than served by the
+    container that is no longer current."""
+
+    keep = True
+
+    def test_queued_request_gets_409_not_a_closed_engine(self):
+        status, body = self.chat(model=None)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["type"], "model_switched")
+        self.assertIn("swap-a", body["error"]["message"])
+        self.assertEqual(self.engine.resets, 0)
+        self.assertEqual(self.engine.calls, [])
+        # The engine was never closed — the refusal is about the slot,
+        # not about a dead ctx.
+        self.assertFalse(self.engine.closed)
+        self.server.engine.reply = self.engine.reply
+        status, body = self.chat(model=None)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["model"], "swap-a")
+
+    def test_stale_slot_is_refused_even_when_engine_still_open(self):
+        """check_engine refuses a stale slot directly, open engine and
+        all — the property the keep_previous torn-state bug violated."""
+        from serve import api as api_mod
+        stale = self.server.current_slot()
+        self.server.load_model("swap-a")
+        with self.assertRaises(api_mod.APIError) as cm:
+            self.server.check_engine(stale)
+        self.assertEqual(cm.exception.status, 409)
+        self.assertEqual(cm.exception.type, "model_switched")
+        self.assertFalse(stale.engine.closed)
 
 
 class TestConcurrency(ServerTestCase):

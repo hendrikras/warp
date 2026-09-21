@@ -41,7 +41,7 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 from . import api, dsml, glmtools, xtml
 from .chatfmt import ChatFormat, ChatFormatError, PlainParser
@@ -64,6 +64,155 @@ class ModelLoadError(EngineError):
     def __init__(self, message: str):
         from .engine import WASTE_E_IO
         super().__init__("model load", WASTE_E_IO, message)
+
+
+class ModelSlot(NamedTuple):
+    """Everything one container makes true, published as one object.
+
+    The per-model facts used to be attributes the server re-bound one at
+    a time on every load, and handlers re-read one at a time. That let a
+    request racing a swap see the new engine with the old chat format —
+    or the old engine with the new one — and build a prompt for a format
+    the container it then generated on does not speak. So the block is a
+    value instead: `detect` builds a fully-resolved slot and the swap
+    publishes it in a single assignment. A request takes the slot once,
+    locks *its* engine, and re-checks the slot is still current before
+    generating; every fact it uses thereafter comes from the slot, not
+    from the moving server.
+    """
+
+    model_id: str
+    engine: Engine
+    model_info: dict
+    markers: dict
+    # One of: the xtml module, the dsml module, a ChatFormat, or None —
+    # None with a chat_error, which refuses chat completions.
+    chat_format: object
+    chat_error: Optional[str]
+    stop_tokens: list
+    default_thinking: bool
+
+    # ---- what the current model makes true -------------------------------
+    #
+    # The block that follows used to run once, in __init__, and every
+    # handler read its verdicts as constants for the life of the process.
+    # With a swappable registry they are per-model: a container without
+    # XTML markers must not inherit the previous container's chat format,
+    # stop tokens, or thinking default. So the same block is a factory,
+    # run again on every load, and it keeps the old comment because every
+    # word of it still holds.
+
+    @classmethod
+    def detect(cls, engine: Engine, model_id: str,
+               start_thinking: bool) -> "ModelSlot":
+        """Derive everything the handlers read from the container rather
+        than from the request: model_info, the reply format, stop tokens,
+        the thinking default.
+
+        The engine lock is NOT taken here — the caller holds it, or (at
+        construction) no request can have arrived yet.
+        """
+        default_thinking = start_thinking
+        try:
+            model_info = engine.model_info()
+        except EngineError:
+            model_info = {}
+        # Markers by token id: the parser decides structure from ids, not
+        # from what the text happens to spell. See regions.py.
+        #
+        # Two formats, asked for in order of what they can express. XTML is
+        # the whole protocol — channels, tools, images — so it is tried
+        # first. A container without it may still describe a plain
+        # conversation in its own chat.json, the file `waste chat` has
+        # always read; serving from the same file means one definition per
+        # container rather than one per client.
+        #
+        # Neither resolving may raise out of here. It used to, which took
+        # the whole process down — including /health, /v1/models and
+        # /v1/completions, none of which need a chat format at all — and
+        # told the operator only that a token had come out as five tokens.
+        # Hold the reason instead and refuse the one endpoint that cannot be
+        # served. What does not change is that the refusal happens: markup
+        # the tokenizer does not have encodes as ordinary text, and the
+        # model would read its own turn structure as prose and answer
+        # anyway. See #34.
+        try:
+            markers = engine.marker_ids()
+            chat_format, chat_error = xtml, None
+            stop_tokens = [tid for tid, text in markers.items()
+                           if text == "<|end_of_msg|>"]
+        except EngineError as e:
+            markers = {}
+            chat_format = None
+            chat_error = str(e)
+            stop_tokens = []
+            # DeepSeek-V4.1's DSML, before the declarative fallback and for
+            # the same reason XTML comes before both: it is a whole protocol
+            # — turns, thinking, tools, images — where chat.json is a plain
+            # conversation. The probe is every marker or none, so a
+            # container that is not this release falls through rather than
+            # half-resolving.
+            try:
+                markers = dsml.detect(engine)
+            except EngineError as e_ds:
+                markers = {}
+                e = f"{e}; and {e_ds}"
+            else:
+                chat_format, chat_error = dsml, None
+                stop_tokens = [tid for tid, text in markers.items()
+                               if text == dsml.EOS]
+                # The generation prompt always opens a channel — so a DSML
+                # container cannot be asked to answer without one being
+                # chosen. Default it on, as the release does.
+                default_thinking = True
+                return cls(model_id, engine, model_info, markers,
+                           chat_format, chat_error, stop_tokens,
+                           default_thinking)
+            try:
+                fmt = ChatFormat.load(engine)
+            except ChatFormatError as e2:
+                # Both reasons, because either one alone misleads: "no XTML"
+                # reads as "wrong model" when the chat.json is simply
+                # missing, and the chat.json reason alone hides that the
+                # richer formats were tried first.
+                chat_error = f"{e}; and {e2}"
+            else:
+                markers = fmt.markers
+                chat_format, chat_error = fmt, None
+                stop_tokens = [fmt.stop_id]
+                # On by default only when the format names a channel. A
+                # container without one refuses a request that asks for it
+                # rather than answering without it; a container whose
+                # generation prompt always opens one — GLM's does — cannot
+                # be asked to answer without it either.
+                default_thinking = fmt.think is not None
+        return cls(model_id, engine, model_info, markers,
+                   chat_format, chat_error, stop_tokens, default_thinking)
+
+    def new_parser(self, thinking: bool, tools=None):
+        """The reply reader for whichever format this container speaks.
+
+        `thinking` says which channel the generation prompt left open.
+        XTML and DSML both have channels to leave open; a chat.json format
+        has one only when it names a think marker.
+        """
+        if self.chat_format is xtml:
+            return RegionParser(in_think=thinking, in_response=not thinking,
+                                markers=self.markers)
+        if self.chat_format is dsml:
+            return dsml.DSMLParser(thinking=thinking, markers=self.markers)
+        fmt = self.chat_format
+        # Which tool protocol the reply reader should own: a GLM container
+        # speaks its own `<tool_call>` grammar, anything else that reaches
+        # a PlainParser speaks Kimi K2's five control tokens.
+        tool_parser = None
+        if getattr(fmt, "tool_protocol", "") == "glm":
+            tool_parser = glmtools.ToolParser(tools=tools)
+        return PlainParser(markers=self.markers,
+                           think_close_id=getattr(fmt, "think_close_id", -1),
+                           in_think=thinking and getattr(fmt, "think", None)
+                           is not None,
+                           tool_parser=tool_parser)
 
 
 class ChatServer(ThreadingHTTPServer):
@@ -111,108 +260,86 @@ class ChatServer(ThreadingHTTPServer):
         self._start_thinking = default_thinking
         self._detect(engine, model_id)
 
+    # The per-model facts live on the current ModelSlot and move only by
+    # whole-slot assignment; these accessors are how the handlers and the
+    # tests read them without taking a slot themselves. A request path
+    # must not use them per-fact — it takes `current_slot()` once.
+
+    @property
+    def engine(self) -> Engine:
+        return self._slot.engine
+
+    @property
+    def model_id(self) -> str:
+        return self._slot.model_id
+
+    @property
+    def model_info(self) -> dict:
+        return self._slot.model_info
+
+    @property
+    def markers(self) -> dict:
+        return self._slot.markers
+
+    @property
+    def chat_format(self):
+        return self._slot.chat_format
+
+    @property
+    def chat_error(self):
+        return self._slot.chat_error
+
+    @property
+    def stop_tokens(self) -> list:
+        return self._slot.stop_tokens
+
+    @property
+    def default_thinking(self) -> bool:
+        return self._slot.default_thinking
+
+    def current_slot(self) -> ModelSlot:
+        """The current model's facts, as one consistent value."""
+        with self._slot_lock:
+            return self._slot
+
+    def check_engine(self, slot: ModelSlot) -> ModelSlot:
+        """Call with slot.engine.lock held, after acquiring it: is this
+        slot still the one the server serves?
+
+        Without keep_previous the swap target may have been *closed* by
+        the time this request's lock was granted — an engine closes under
+        its own lock, so a request queued on it either ran first (fine) or
+        gets the lock after close. Answering on the closed engine is the
+        500 the check exists to prevent; answering on the other engine is
+        the torn-state bug. Either way the request is not served: 409 with
+        the model that is current now, so the client re-reads
+        GET /v1/models and retries explicitly rather than being silently
+        migrated to a different model mid-conversation.
+        """
+        current = self.current_slot()
+        if slot is not current:
+            raise api.APIError(
+                f"model switched to {current.model_id} while this request "
+                f"was queued; re-read GET /v1/models and retry",
+                status=409, type="model_switched", param="model")
+        return current
+
     def _default_engine_factory(self, path: str) -> Engine:
         """How a swap opens a container. Overridable — tests hand in a
         factory that builds the scripted engine, and a host embedding the
         server may want its own construction arguments."""
         return Engine(path, **self.engine_kwargs)
 
-    # ---- what the current model makes true -------------------------------
-    #
-    # The block that follows used to run once, in __init__, and every
-    # handler read its verdicts as constants for the life of the process.
-    # With a swappable registry they are per-model: a container without
-    # XTML markers must not inherit the previous container's chat format,
-    # stop tokens, or thinking default. So the same block is a method, run
-    # again on every load, and it keeps the old comment because every word
-    # of it still holds.
-
     def _detect(self, engine: Engine, model_id: str) -> None:
-        """Bind `engine` as the current model and re-derive everything the
-        handlers read from the container rather than from the request:
-        model_info, the reply format, stop tokens, the thinking default.
+        """Bind `engine` as the current model and publish everything the
+        handlers read from the container — as one slot, in one assignment.
 
         The engine lock is NOT taken here — the caller holds it, or (at
         construction) no request can have arrived yet.
         """
-        self.engine = engine
-        self.model_id = model_id
-        self.default_thinking = self._start_thinking
-        try:
-            self.model_info = engine.model_info()
-        except EngineError:
-            self.model_info = {}
-        # Markers by token id: the parser decides structure from ids, not
-        # from what the text happens to spell. See regions.py.
-        #
-        # Two formats, asked for in order of what they can express. XTML is
-        # the whole protocol — channels, tools, images — so it is tried
-        # first. A container without it may still describe a plain
-        # conversation in its own chat.json, the file `waste chat` has
-        # always read; serving from the same file means one definition per
-        # container rather than one per client.
-        #
-        # Neither resolving may raise out of here. It used to, which took
-        # the whole process down — including /health, /v1/models and
-        # /v1/completions, none of which need a chat format at all — and
-        # told the operator only that a token had come out as five tokens.
-        # Hold the reason instead and refuse the one endpoint that cannot be
-        # served. What does not change is that the refusal happens: markup
-        # the tokenizer does not have encodes as ordinary text, and the
-        # model would read its own turn structure as prose and answer
-        # anyway. See #34.
-        try:
-            self.markers = engine.marker_ids()
-            self.chat_format = xtml
-            self.chat_error = None
-            self.stop_tokens = [tid for tid, text in self.markers.items()
-                                if text == "<|end_of_msg|>"]
-        except EngineError as e:
-            self.markers = {}
-            self.chat_format = None
-            self.chat_error = str(e)
-            self.stop_tokens = []
-            # DeepSeek-V4.1's DSML, before the declarative fallback and for
-            # the same reason XTML comes before both: it is a whole protocol
-            # — turns, thinking, tools, images — where chat.json is a plain
-            # conversation. The probe is every marker or none, so a
-            # container that is not this release falls through rather than
-            # half-resolving.
-            try:
-                self.markers = dsml.detect(engine)
-            except EngineError as e_ds:
-                self.markers = {}
-                e = f"{e}; and {e_ds}"
-            else:
-                self.chat_format = dsml
-                self.chat_error = None
-                self.stop_tokens = [tid for tid, text in self.markers.items()
-                                    if text == dsml.EOS]
-                # The generation prompt always opens a channel — <think> or
-                # </think> — so a DSML container cannot be asked to answer
-                # without one being chosen. Default it on, as the release
-                # does.
-                self.default_thinking = True
-                return
-            try:
-                fmt = ChatFormat.load(engine)
-            except ChatFormatError as e2:
-                # Both reasons, because either one alone misleads: "no XTML"
-                # reads as "wrong model" when the chat.json is simply
-                # missing, and the chat.json reason alone hides that the
-                # richer formats were tried first.
-                self.chat_error = f"{e}; and {e2}"
-            else:
-                self.markers = fmt.markers
-                self.chat_format = fmt
-                self.chat_error = None
-                self.stop_tokens = [fmt.stop_id]
-                # On by default only when the format names a channel. A
-                # container without one refuses a request that asks for it
-                # rather than answering without it; a container whose
-                # generation prompt always opens one — GLM's does — cannot
-                # be asked to answer without it either.
-                self.default_thinking = fmt.think is not None
+        slot = ModelSlot.detect(engine, model_id, self._start_thinking)
+        with self._slot_lock:
+            self._slot = slot
 
     # ---- the model registry ----------------------------------------------
 
@@ -264,18 +391,23 @@ class ChatServer(ThreadingHTTPServer):
         the engine can actually get.
 
         The old engine's lock is held across the whole swap, so a
-        generation in flight finishes before the slot moves under it, and
-        no request that took the old lock can find its engine closed.
+        generation in flight finishes before the slot moves under it.
+        A request that queued on the old engine and is granted the lock
+        only after the swap finds the slot moved and answers 409 — see
+        check_engine — rather than generating on a closed or wrong
+        container. The per-model facts move with the slot: one assignment
+        publishes engine, format, markers, stop tokens and thinking
+        default together, so no reader can see a half-updated set.
         """
         with self._slot_lock:
             current = self._current()
-            if model_id == current[0]:
+            if model_id == current[0].model_id:
                 return None
             path = self.registry.get(model_id)
             if path is None:
                 raise api.APIError(f"no such model: {model_id}", status=404,
                                    type="not_found_error", param="model")
-            previous_id, previous_engine = current
+            previous_slot, previous_engine = current
             # A model kept resident by keep_previous does not need an
             # open at all — its waste_ctx still holds the state it had.
             # Moving the slot to it costs a format re-detect, not a load.
@@ -283,7 +415,7 @@ class ChatServer(ThreadingHTTPServer):
             with previous_engine.lock:
                 if resident is not None:
                     self._detect(resident, model_id)
-                    return previous_id
+                    return previous_slot.model_id
                 try:
                     engine = self.engine_factory(path)
                 except EngineError as e:
@@ -292,15 +424,15 @@ class ChatServer(ThreadingHTTPServer):
                 self._detect(engine, model_id)
                 self.engines[model_id] = engine
                 if self.keep_previous:
-                    return previous_id
-                self.engines.pop(previous_id)
+                    return previous_slot.model_id
+                self.engines.pop(previous_slot.model_id)
                 previous_engine.close()
-                return previous_id
+                return previous_slot.model_id
 
     def _current(self) -> tuple:
-        with self._slot_lock:
-            model_id = self.model_id
-            return model_id, self.engines.get(model_id, self.engine)
+        """(the current ModelSlot, its engine). Call with _slot_lock held."""
+        slot = self._slot
+        return slot, slot.engine
 
     def close_engines(self) -> None:
         """Every engine this server still holds. The shutdown path; with
@@ -310,29 +442,10 @@ class ChatServer(ThreadingHTTPServer):
         self.engines.clear()
 
     def new_parser(self, thinking: bool, tools=None):
-        """The reply reader for whichever format this container speaks.
-
-        `thinking` says which channel the generation prompt left open.
-        XTML and DSML both have channels to leave open; a chat.json format
-        has one only when it names a think marker.
-        """
-        if self.chat_format is xtml:
-            return RegionParser(in_think=thinking, in_response=not thinking,
-                                markers=self.markers)
-        if self.chat_format is dsml:
-            return dsml.DSMLParser(thinking=thinking, markers=self.markers)
-        fmt = self.chat_format
-        # Which tool protocol the reply reader should own: a GLM container
-        # speaks its own `<tool_call>` grammar, anything else that reaches
-        # a PlainParser speaks Kimi K2's five control tokens.
-        tool_parser = None
-        if getattr(fmt, "tool_protocol", "") == "glm":
-            tool_parser = glmtools.ToolParser(tools=tools)
-        return PlainParser(markers=self.markers,
-                           think_close_id=getattr(fmt, "think_close_id", -1),
-                           in_think=thinking and getattr(fmt, "think", None)
-                           is not None,
-                           tool_parser=tool_parser)
+        """The reply reader for the current container. Reads the slot under
+        the lock, so a request that calls it (as the chat path does, inside
+        its locked section) gets the parser of the model it is serving."""
+        return self.current_slot().new_parser(thinking, tools=tools)
 
     def handle_error(self, request, client_address):
         """A client hanging up is not an error worth a traceback.
@@ -544,7 +657,13 @@ class Handler(BaseHTTPRequestHandler):
     def _chat(self):
         body = self._read_body()
         srv = self.server
-        engine = srv.engine
+        # One snapshot, taken before the lock and used for everything this
+        # request decides: the engine it will lock, the format it renders
+        # the prompt in, the ctx it reads, the tokens it stops on. Reading
+        # them one attribute at a time off the server is what let a request
+        # racing a swap see the new engine with the old chat format.
+        slot = srv.current_slot()
+        engine = slot.engine
         self._log_model_from(body)
 
         # Before anything else, and before the engine lock: a request that
@@ -558,10 +677,10 @@ class Handler(BaseHTTPRequestHandler):
         # 400 rather than 501 because for an OpenAI client the unsupported
         # thing is the model, which is a request parameter — and a 501 is
         # the one status those clients tend to retry.
-        if srv.chat_error:
+        if slot.chat_error:
             raise api.APIError(
                 f"this model cannot be used for chat completions: "
-                f"{srv.chat_error}. serve/ renders Kimi K3's XTML prompt "
+                f"{slot.chat_error}. serve/ renders Kimi K3's XTML prompt "
                 f"format and no other. POST /v1/completions for raw "
                 f"continuation, or use `waste chat`, which reads the "
                 f"container's own chat.json",
@@ -584,39 +703,47 @@ class Handler(BaseHTTPRequestHandler):
         #    between its own build and generate would hand the second
         #    request the first one's pictures.
         with engine.lock:
+            # First thing under the lock: did the slot move between the
+            # snapshot and this grant? Without keep_previous the swap may
+            # also have *closed* this engine — close takes the same lock,
+            # so we are here either before it (our generation runs to
+            # completion, the swap waits) or after it, and the check
+            # refuses before state_reset touches the dead ctx.
+            srv.check_engine(slot)
+
             engine.state_reset()
 
             prompt = api.build_prompt(
                 engine, body,
-                default_thinking=srv.default_thinking,
+                default_thinking=slot.default_thinking,
                 allow_local_images=srv.allow_local_images,
-                tmpdir=srv.tmpdir, fmt=srv.chat_format)
+                tmpdir=srv.tmpdir, fmt=slot.chat_format)
 
             opts = api.generation_options(
                 body, default_max_tokens=srv.default_max_tokens,
-                ctx_max=srv.model_info.get("ctx_max", 0),
+                ctx_max=slot.model_info.get("ctx_max", 0),
                 prompt_len=len(prompt.tokens))
             stops = api.stop_strings(body)
 
             request_id = api.new_id("chatcmpl")
             created = api.now()
-            parser = srv.new_parser(prompt.thinking, tools=body.get("tools"))
+            parser = slot.new_parser(prompt.thinking, tools=body.get("tools"))
 
             if stream:
-                self._chat_stream(body, prompt, opts, stops, parser,
+                self._chat_stream(slot, body, prompt, opts, stops, parser,
                                   request_id, created)
             else:
-                self._chat_blocking(body, prompt, opts, stops, parser,
+                self._chat_blocking(slot, body, prompt, opts, stops, parser,
                                     request_id, created)
 
-    def _run(self, prompt, opts, stops, parser, on_delta):
+    def _run(self, slot, prompt, opts, stops, parser, on_delta):
         """Drive one generation. Returns (n_tokens, hit_limit, stopped).
 
         `on_delta(delta)` is called on the engine thread for each token, and
         may raise Cancelled to stop — which is how a disconnected streaming
         client stops the generation rather than paying for all of it.
         """
-        engine = self.server.engine
+        engine = slot.engine
         stops = [s for s in stops if s]
         state = {"n": 0, "stopped": False, "content_sent": 0}
 
@@ -664,7 +791,7 @@ class Handler(BaseHTTPRequestHandler):
             temperature=opts["temperature"], top_p=opts["top_p"],
             top_k=opts["top_k"], seed=opts["seed"],
             max_tokens=opts["max_tokens"],
-            stop_tokens=self.server.stop_tokens or None)
+            stop_tokens=slot.stop_tokens or None)
         tail = parser.finish()
         if not state["stopped"]:
             if deliver(tail, final=True):
@@ -672,23 +799,23 @@ class Handler(BaseHTTPRequestHandler):
         hit_limit = completed and state["n"] >= opts["max_tokens"]
         return state["n"], hit_limit, state["stopped"]
 
-    def _chat_blocking(self, body, prompt, opts, stops, parser,
+    def _chat_blocking(self, slot, body, prompt, opts, stops, parser,
                        request_id, created):
         t0 = time.time()
-        n, hit_limit, stopped = self._run(prompt, opts, stops, parser,
+        n, hit_limit, stopped = self._run(slot, prompt, opts, stops, parser,
                                           lambda d: None)
         reason = api.finish_reason(parser, hit_limit=hit_limit, stopped=stopped)
         usage = api.usage_block(len(prompt.tokens), n)
         payload = api.chat_completion(
-            parser, model=self.server.model_id, request_id=request_id,
+            parser, model=slot.model_id, request_id=request_id,
             created=created, reason=reason, usage=usage,
-            extra=api.engine_extra(self.server.engine.stats(),
+            extra=api.engine_extra(slot.engine.stats(),
                                    ms=(time.time() - t0) * 1000))
         self._send_json(200, payload)
 
-    def _chat_stream(self, body, prompt, opts, stops, parser,
+    def _chat_stream(self, slot, body, prompt, opts, stops, parser,
                      request_id, created):
-        model = self.server.model_id
+        model = slot.model_id
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -742,8 +869,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise Cancelled()
 
         try:
-            n, hit_limit, stopped = self._run(prompt, opts, stops, parser,
-                                              on_delta)
+            n, hit_limit, stopped = self._run(slot, prompt, opts, stops,
+                                              parser, on_delta)
         except Cancelled:
             # The client is gone. Nothing left to write to.
             return
@@ -778,7 +905,7 @@ class Handler(BaseHTTPRequestHandler):
                        "usage": usage})
             write({"id": request_id, "object": "chat.completion.chunk",
                    "created": created, "model": model, "choices": [],
-                   "waste": api.engine_extra(self.server.engine.stats(),
+                   "waste": api.engine_extra(slot.engine.stats(),
                                              ms=(time.time() - t0) * 1000)})
             write("[DONE]")
             self.wfile.write(b"0\r\n\r\n")
@@ -797,6 +924,11 @@ class Handler(BaseHTTPRequestHandler):
         """
         body = self._read_body()
         srv = self.server
+        # Same discipline as _chat: one snapshot before the lock, and a
+        # re-check under it, so a request queued behind a swap answers 409
+        # instead of generating on a closed (or wrong) engine.
+        slot = srv.current_slot()
+        engine = slot.engine
         self._log_model_from(body)      # before check_model_request: a 404 or
         # 409 line should still name the model that was refused
         srv.check_model_request(body)
@@ -809,15 +941,16 @@ class Handler(BaseHTTPRequestHandler):
             raise api.APIError("'prompt' must be a non-empty string",
                                param="prompt")
 
-        with srv.engine.lock:
-            srv.engine.state_reset()      # each request stands alone
-            tokens = srv.engine.tokenize(prompt_text)
+        with engine.lock:
+            srv.check_engine(slot)
+            engine.state_reset()      # each request stands alone
+            tokens = engine.tokenize(prompt_text)
             if not tokens:
                 raise api.APIError("'prompt' encoded to no tokens",
                                    param="prompt")
             opts = api.generation_options(
                 body, default_max_tokens=srv.default_max_tokens,
-                ctx_max=srv.model_info.get("ctx_max", 0),
+                ctx_max=slot.model_info.get("ctx_max", 0),
                 prompt_len=len(tokens))
             stops = api.stop_strings(body)
 
@@ -832,11 +965,11 @@ class Handler(BaseHTTPRequestHandler):
                         return False
                 return True
 
-            completed = srv.engine.generate(
+            completed = engine.generate(
                 tokens, on_token, temperature=opts["temperature"],
                 top_p=opts["top_p"], top_k=opts["top_k"], seed=opts["seed"],
                 max_tokens=opts["max_tokens"],
-                stop_tokens=srv.stop_tokens or None)
+                stop_tokens=slot.stop_tokens or None)
 
         text = "".join(pieces)
         for s in stops:
@@ -847,7 +980,7 @@ class Handler(BaseHTTPRequestHandler):
             "id": api.new_id("cmpl"),
             "object": "text_completion",
             "created": api.now(),
-            "model": srv.model_id,
+            "model": slot.model_id,
             "choices": [{"index": 0, "text": text, "logprobs": None,
                          "finish_reason": "length" if hit_limit else "stop"}],
             "usage": api.usage_block(len(tokens), len(pieces)),
