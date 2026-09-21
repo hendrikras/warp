@@ -55,6 +55,22 @@ def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:24]}"
 
 
+def human_bytes(n: float) -> str:
+    """A byte count in the units a person reads.
+
+    Shared on purpose: `serve/__main__.py` prints memory plans with it and
+    `serve/server.py` refuses an over-budget swap with it. An operator
+    comparing "this budget fits" against "it does not" should not be doing
+    two conversions, and a refusal that quotes a different figure than the
+    banner it is arguing with is worse than no message.
+    """
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
 # ---- request validation --------------------------------------------------
 
 

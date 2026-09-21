@@ -45,7 +45,8 @@ from typing import Callable, NamedTuple, Optional
 
 from . import api, dsml, glmtools, xtml
 from .chatfmt import ChatFormat, ChatFormatError, PlainParser
-from .engine import Cancelled, Engine, EngineError
+from .engine import (Cancelled, Engine, EngineError, plan_memory,
+                     usable_ram)
 from .regions import RegionParser
 
 SERVER_NAME = "waste"
@@ -231,9 +232,28 @@ class ChatServer(ThreadingHTTPServer):
                  models: Optional[dict] = None,
                  keep_previous: bool = False,
                  engine_kwargs: Optional[dict] = None,
-                 engine_factory: Optional[Callable] = None):
+                 engine_factory: Optional[Callable] = None,
+                 usable_ram: Optional[int] = None,
+                 memory_plan: Optional[Callable] = None):
         super().__init__(addr, handler)
         self.engine_kwargs = dict(engine_kwargs or {})
+        # The ceiling every swap-open is given, when there is one. It is
+        # also the number the resident-set check counts with: an explicit
+        # budget is used exactly as given (waste.h), so a resident model's
+        # footprint is known without asking the container. 0 means the
+        # engine sizes itself, and then the check asks instead.
+        self.ram_budget_bytes = int(self.engine_kwargs.get("ram_budget_bytes")
+                                    or 0)
+        # What the machine may use, in bytes: passed in by `serve/__main__`
+        # (which measures it once for its own startup checks), or measured
+        # on first use. None = not known yet; 0 = this platform would not
+        # say, and nothing is refused on a number nobody has.
+        self._usable_ram = usable_ram
+        # How a container's own plan is read, for the check below and for
+        # a host whose containers are not files on this machine. The real
+        # one reads the manifest only — no weights — so asking it before
+        # an open costs nothing next to the open.
+        self.memory_plan = memory_plan or plan_memory
         self.keep_previous = keep_previous
         self.engine_factory = engine_factory or self._default_engine_factory
         self._slot_lock = threading.RLock()
@@ -366,6 +386,123 @@ class ChatServer(ThreadingHTTPServer):
             f"to switch to it", status=409, type="model_not_loaded",
             param="model")
 
+    # ---- what the machine has room for -----------------------------------
+    #
+    # A swap holds two contexts at once: the new container is opened before
+    # the old one is closed, deliberately, so that a failed open leaves the
+    # server serving what it was serving. docs/SERVE.md used to ask the
+    # operator to size --budget so that moment fits, and nothing checked;
+    # with the default budget of 0 each context sizes itself to up to 3/4
+    # of waste_usable_ram (waste.h), so the moment was ~1.5x what the
+    # process may use. With --keep-previous the total is not two but every
+    # model ever loaded, which no amount of sizing at startup can bound.
+    #
+    # So the resident set is counted, against the budgets it was opened
+    # with, and a load that would not fit is refused *before* the open.
+
+    def usable_ram_bytes(self) -> int:
+        """What this process may use, in bytes. 0 = this platform will not
+        say, in which case nothing here refuses anything: a limit nobody
+        can measure is not a limit, and refusing to serve a model because
+        the machine would not report its RAM is worse than the thing this
+        check exists to prevent."""
+        if self._usable_ram is None:
+            try:
+                self._usable_ram = int(usable_ram())
+            except EngineError:
+                self._usable_ram = 0
+        return self._usable_ram
+
+    def engine_budget(self, engine: Engine) -> int:
+        """What one resident model holds.
+
+        An explicit budget is exactly what the engine was opened with —
+        waste.h calls it a hard ceiling on all engine allocations, used as
+        given — and every open goes through `engine_kwargs`, whose
+        contract is that it holds the same arguments the startup engine
+        was opened with. When the engine chose its own, the ceiling is
+        whatever its ladder resolved to, and waste_memory_used reports the
+        result: the plan's floor plus the expert cache it actually
+        allocated (n_slots x record bytes). Neither is an estimate; both
+        come from the context that holds the memory.
+        """
+        if self.ram_budget_bytes:
+            return self.ram_budget_bytes
+        try:
+            used = engine.memory_used()
+        except EngineError:
+            return 0
+        return int(used.get("floor_bytes", 0)
+                   + used.get("min_expert_cache", 0))
+
+    def planned_budget(self, path: str) -> int:
+        """What a container would ask for when no --budget is configured.
+
+        A prediction, and named one. With 0 the engine walks its own ladder
+        — floor plus whole expert working sets, under 3/4 of usable RAM —
+        and nothing here can run that ladder without opening the container.
+        It uses the ladder's own definition of "worth having",
+        recommended_bytes, which is the number waste_plan_memory exists to
+        give. The CLI never relies on this: --models requires an explicit
+        --budget, so every figure on that path is exact.
+        """
+        try:
+            ctx = int(self.engine_kwargs.get("ctx_tokens") or 0)
+            plan = self.memory_plan(path, ctx)
+        except (EngineError, OSError):
+            return 0
+        return int(getattr(plan, "recommended_bytes", 0))
+
+    def check_room(self, model_id: str, path: str) -> None:
+        """Refuse a load that would not fit next to what stays resident.
+
+        Call with _slot_lock held, *before* the container is opened. Only
+        the case that needs a new context is checked: a load that moves the
+        slot to an engine already in `engines` — what --keep-previous makes
+        free — adds no memory and is never refused.
+
+        What stays resident is the whole point of the two modes: without
+        keep_previous the previous model alone is resident alongside the
+        new one until the swap completes, so the number is 2 x budget; with
+        it, every model in `engines` stays and the total is their sum. That
+        sum is the cap --keep-previous needs — it derives one from the
+        budgets rather than from a hand-set count, so it cannot disagree
+        with what the engines actually hold.
+
+        Evicting a resident model to make room was the alternative and is
+        rejected: it changes what is resident behind a client's back, which
+        is the exact failure --keep-previous exists to prevent.
+
+        507 rather than 503: the request is well-formed and the server will
+        never satisfy it by being asked again — an operator has to change
+        --budget, drop --keep-previous, or restart. A 503 invites a retry
+        loop that cannot end.
+
+        Nothing is opened, closed or moved when this refuses, so the model
+        that was serving keeps serving and answers with the reason.
+        """
+        usable = self.usable_ram_bytes()
+        if not usable:
+            return
+        if self.keep_previous:
+            stays = sorted(self.engines)
+        else:
+            stays = [self._current()[0].model_id]
+        held = sum(self.engine_budget(self.engines[m]) for m in stays)
+        need = self.ram_budget_bytes or self.planned_budget(path)
+        if held + need <= usable:
+            return
+        raise api.APIError(
+            f"loading {model_id} would need "
+            f"{api.human_bytes(need)} next to the "
+            f"{api.human_bytes(held)} held by "
+            f"{', '.join(stays)}: {api.human_bytes(held + need)} against "
+            f"the {api.human_bytes(usable)} this machine may use. The "
+            f"current model is still serving. Lower --budget, drop "
+            f"--keep-previous, or start a second server for a resident set "
+            f"this size cannot hold",
+            status=507, type="insufficient_memory", param="model")
+
     def load_model(self, model_id: str) -> Optional[str]:
         """Make `model_id` the current model, and return the id of the
         model that was current before (None when it already was).
@@ -387,8 +524,8 @@ class ChatServer(ThreadingHTTPServer):
         guarantee that is not to have closed it yet. A failed swap costs
         a load's worth of RAM for a moment; a swap that leaves no model
         loaded costs the whole server. When two containers genuinely will
-        not fit together, size --budget so each open plans against what
-        the engine can actually get.
+        not fit together the load is refused before the open — see
+        check_room, and 507 — rather than being attempted into paging.
 
         The old engine's lock is held across the whole swap, so a
         generation in flight finishes before the slot moves under it.
@@ -416,6 +553,11 @@ class ChatServer(ThreadingHTTPServer):
                 if resident is not None:
                     self._detect(resident, model_id)
                     return previous_slot.model_id
+                # Room for it, before a byte of it is allocated — and
+                # before anything is closed, so a refusal here is
+                # indistinguishable from never having been asked: same
+                # current model, same resident set, same open containers.
+                self.check_room(model_id, path)
                 try:
                     engine = self.engine_factory(path)
                 except EngineError as e:
@@ -994,7 +1136,9 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
           ready: Optional[threading.Event] = None,
           models: Optional[dict] = None, keep_previous: bool = False,
           engine_kwargs: Optional[dict] = None,
-          engine_factory: Optional[Callable] = None) -> ChatServer:
+          engine_factory: Optional[Callable] = None,
+          usable_ram: Optional[int] = None,
+          memory_plan: Optional[Callable] = None) -> ChatServer:
     """Build the server. The caller decides whether to serve_forever.
 
     models names the rest of the swappable registry (id -> container
@@ -1003,6 +1147,12 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
     on a swap — the same arguments the startup engine was opened with —
     and engine_factory replaces that factory wholesale, for a host that
     builds engines its own way (tests do exactly that).
+
+    usable_ram is what the resident-set check counts against — pass the
+    figure already measured so a load never probes for it — and
+    memory_plan is how a container with no explicit budget is priced.
+    Both default to the real thing, and neither is needed by a caller
+    that never swaps models.
     """
     # IPv6-capable when the host asks for it, without forcing it: binding
     # :: on a host with IPv6 disabled fails outright.
@@ -1015,7 +1165,8 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
                      log_requests=log_requests, models=models,
                      keep_previous=keep_previous,
                      engine_kwargs=engine_kwargs,
-                     engine_factory=engine_factory)
+                     engine_factory=engine_factory,
+                     usable_ram=usable_ram, memory_plan=memory_plan)
     if ready is not None:
         ready.set()
     return srv

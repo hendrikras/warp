@@ -350,7 +350,26 @@ What a swap does:
   that fails — a truncated container, an `--exclusive-open` conflict —
   leaves the server serving what it was serving and answers 500 with the
   engine's own reason. The cost of that guarantee is a moment where both
-  containers are resident; size `--budget` so that moment fits.
+  containers are resident, and that moment is checked rather than
+  assumed: `--models` **requires `--budget`**, and `2 x budget` has to
+  fit in `waste_usable_ram()` or the server refuses to start. The reason
+  is the default. With `--budget 0` each context sizes itself to as much
+  as 3/4 of usable RAM, so two of them at once is ~1.5x what the process
+  may use — paging, not slowness. At startup the numbers are printed:
+
+      registry  glm53, ds41
+                glm53  floor 12.3 GB, recommended 30.1 GB
+                ds41   floor 18.7 GB, recommended 44.2 GB
+                two at once: 48.0 GB against 64.0 GB usable — fits
+
+  `--plan` prints the same lines without starting anything, which is how
+  to choose the budget in the first place.
+- A load that would not fit is refused **before the container is
+  opened**, with **507** and `type: insufficient_memory`: nothing is
+  closed, nothing is half-loaded, the previous model keeps serving, and
+  the message says what it needed next to what was already held. 507
+  rather than 503 because asking again cannot help — an operator has to
+  lower `--budget`, drop `--keep-previous`, or restart.
 - Generation always serves the current model. A request naming a
   registered-but-not-loaded model is a 409, telling the client to
   `POST /v1/models/load` first, rather than an unnoticed multi-gigabyte
@@ -363,10 +382,23 @@ What a swap does:
 
 `--keep-previous` keeps the replaced model resident instead of unloading
 it. Switching back to it is then a slot move rather than a reopen — its
-`waste_ctx` and the state it holds are still there. The RAM two resident
+`waste_ctx` and the state it holds are still there — and a slot move is
+never refused, because it allocates nothing. The RAM two resident
 contexts need is the sum of their budgets; on the machines this engine
 targets that is usually the difference between working and paging, which
 is why unloading is the default.
+
+It also makes the total unbounded by anything a startup check can know,
+since every model switched to stays resident: three models at a budget of
+20 GB under a 64 GB machine is not a pair anyone can validate in advance.
+So the resident set is counted at each load — every engine's budget, or,
+when it chose its own, the floor and expert cache `waste_memory_used`
+reports for it — and the load that would put the sum over
+`waste_usable_ram()` is refused with the same 507. There is no separate
+`--max-resident` number to keep in step with the budgets: the cap is
+derived from them. A model that does not fit is not evicted to make room
+either — changing what is resident behind a client's back is the failure
+`--keep-previous` exists to prevent.
 
 Streaming is written straight from the token callback, on the thread
 holding the lock. A client hanging up propagates back as a return value the
@@ -493,7 +525,9 @@ K3_DIR=/Volumes/WasteDisk/k3 python3 tools/gen_xtml_goldens.py
 python3 -m serve MODEL [options]
 
   --host, --port, --model-id, --api-key
-  --budget SIZE      hard RAM ceiling, e.g. 48G (0 = the engine chooses)
+  --budget SIZE      hard RAM ceiling, e.g. 48G (0 = the engine chooses,
+                     which is up to 3/4 of usable RAM per context — so
+                     --models needs this set explicitly)
   --ctx N            context tokens
   --threads N        compute threads (0 = one per core)
   --cpus LIST        restrict them to a cpu list, e.g. 0-5 or 0-2,6-8;
@@ -510,9 +544,13 @@ python3 -m serve MODEL [options]
   --allow-local-images
   --models PATH[=ID] additional containers a client may switch to with
                      POST /v1/models/load (repeatable; switching unloads
-                     the model it replaces)
+                     the model it replaces). Requires --budget, because a
+                     swap holds two contexts at once: 2 x budget has to
+                     fit in RAM or the server refuses to start
   --keep-previous    keep the replaced model resident instead of unloading
-                     it; RAM needed is then the sum of both budgets
+                     it; every model switched to stays resident, so the
+                     load that would put the set over the machine's RAM is
+                     refused with 507
   --plan             print the memory plan and exit
   --no-log-requests  silence the per-request log lines
 ```

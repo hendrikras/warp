@@ -1142,6 +1142,203 @@ class TestModelSwapKeepPrevious(TestModelSwap):
         self.assertFalse(self.engine.closed)
 
 
+class TestSwapMemoryBudget(ServerTestCase):
+    """A swap has to fit in the machine.
+
+    The new container is opened before the old one is closed — that order
+    is the rollback guarantee — so two contexts are resident at once, and
+    --keep-previous makes the set grow with every model ever loaded. The
+    server counts the resident budgets against what the process may use
+    and refuses a load that would exceed it *before* the open, so nothing
+    is closed and nothing is half-loaded: the previous model keeps
+    serving.
+
+    The budgets are the test's own. `usable_ram` is passed in, so what is
+    asserted is the arithmetic rather than the machine the suite happens
+    to run on, and the engines are scripted, so a budget of 10 is 10 and
+    not whatever a real container would resolve to.
+    """
+
+    keep = False
+    usable = 25
+    budget = 10
+
+    def make_engine(self, path: str) -> FakeEngine:
+        engine = FakeEngine(model_path=path, markers=dict(MARKERS))
+        self.made.append(engine)
+        return engine
+
+    def setUp(self):
+        self.made: list[FakeEngine] = []
+        self.engine_kwargs = {"model_path": "/fake/start.waste"}
+        self.server_kwargs = {
+            "models": {"swap-a": "/fake/a.waste", "swap-b": "/fake/b.waste"},
+            "keep_previous": self.keep,
+            "engine_factory": self.make_engine,
+            "engine_kwargs": {"ram_budget_bytes": self.budget},
+            "usable_ram": self.usable,
+        }
+        ServerTestCase.setUp(self)
+
+    def load(self, model):
+        return self.post("/v1/models/load", {"model": model})
+
+
+class TestSwapMemoryBudgetFits(TestSwapMemoryBudget):
+    """Two budgets of 10 under a 25-byte machine: the window fits, and the
+    swap behaves exactly as it did before the check existed."""
+
+    def test_a_pair_that_fits_loads(self):
+        status, body = self.load("swap-a")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["loaded"], "swap-a")
+        self.assertTrue(self.engine.closed)     # replaced, as always
+        self.assertEqual(list(self.server.engines), ["swap-a"])
+
+    def test_the_check_counts_a_budget_against_the_machine(self):
+        """The number is the ceiling the factory was told to open with,
+        not a measurement taken after the fact."""
+        self.assertEqual(self.server.engine_budget(self.engine), self.budget)
+        self.assertEqual(self.server.usable_ram_bytes(), self.usable)
+
+
+class TestSwapMemoryBudgetTooSmall(TestSwapMemoryBudget):
+    """2 x budget does not fit in usable: the swap window itself is over."""
+
+    usable = 15
+
+    def test_a_pair_that_does_not_fit_is_507(self):
+        status, body = self.load("swap-a")
+        self.assertEqual(status, 507)
+        self.assertEqual(body["error"]["type"], "insufficient_memory")
+        message = body["error"]["message"]
+        self.assertIn("swap-a", message)
+        self.assertIn("10 B", message)          # what it would need
+        self.assertIn("20 B", message)          # against 2 x budget
+        self.assertIn("15 B", message)          # and what the machine has
+
+    def test_nothing_moved_on_a_refusal(self):
+        self.load("swap-a")
+        # No engine was built, nothing was closed, and the model that was
+        # serving is still the one the server reports.
+        self.assertEqual(self.made, [])
+        self.assertFalse(self.engine.closed)
+        self.assertEqual(list(self.server.engines), ["test-model"])
+        self.assertEqual(self.server.model_id, "test-model")
+        self.assertEqual(self.server.engine, self.engine)
+        # And it still answers — the refusal cost this server nothing.
+        status, body = self.chat()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["model"], "test-model")
+
+
+class TestSwapMemoryBudgetKeepPrevious(TestSwapMemoryBudget):
+    """--keep-previous: every model switched to stays resident, so the set
+    is unbounded by anything --budget alone can say. The ledger is what
+    bounds it, and it is derived from the same budgets."""
+
+    keep = True
+
+    def test_the_resident_set_grows_until_it_would_not_fit(self):
+        status, _ = self.load("swap-a")
+        self.assertEqual(status, 200)           # 2 x 10 <= 25
+        status, body = self.load("swap-b")
+        self.assertEqual(status, 507)           # 3 x 10 > 25
+        self.assertEqual(body["error"]["type"], "insufficient_memory")
+        message = body["error"]["message"]
+        self.assertIn("swap-b", message)
+        self.assertIn("10 B", message)          # wanted
+        self.assertIn("20 B", message)          # held, by name:
+        self.assertIn("swap-a", message)
+        self.assertIn("test-model", message)
+        self.assertIn("30 B", message)          # the moment's total
+        self.assertIn("25 B", message)          # against what the machine has
+        # The set that was already resident is untouched, and one of its
+        # models is still the one serving.
+        self.assertEqual(sorted(self.server.engines),
+                         ["swap-a", "test-model"])
+        self.assertEqual(self.server.model_id, "swap-a")
+        self.assertFalse(any(e.closed for e in self.server.engines.values()))
+
+    def test_switching_back_to_a_resident_model_is_never_refused(self):
+        """No open, no memory: a slot move costs a re-detect. This is the
+        property of --keep-previous that must not be taxed by the check."""
+        self.load("swap-a")                     # now at the limit: 20/25
+        status, body = self.load("test-model")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["loaded"], "test-model")
+        self.assertEqual([e.model_path for e in self.made],
+                         ["/fake/a.waste"])
+
+
+class TestSwapMemoryBudgetWithoutABudget(ServerTestCase):
+    """No --budget: the engine sizes each context itself, so there is no
+    ceiling to count with and the check prices the container with
+    waste_plan_memory instead — recommended_bytes, the ladder's own
+    definition of "worth having". The CLI does not rely on this, because
+    --models requires an explicit --budget; a host that calls serve()
+    directly is the case it covers."""
+
+    usable = 12
+    recommended = 8
+
+    class Plan:
+        def __init__(self, recommended: int):
+            self.floor_bytes = 4
+            self.recommended_bytes = recommended
+
+    def plan(self, path: str, ctx: int):
+        return self.Plan(self.recommended)
+
+    def make_engine(self, path: str) -> FakeEngine:
+        engine = FakeEngine(model_path=path, markers=dict(MARKERS))
+        self.made.append(engine)
+        return engine
+
+    def server_kwargs_for(self, usable: int) -> dict:
+        return {
+            "models": {"swap-a": "/fake/a.waste"},
+            "engine_factory": self.make_engine,
+            "usable_ram": usable,
+            "memory_plan": self.plan,
+        }
+
+    def setUp(self):
+        self.made: list[FakeEngine] = []
+        self.engine_kwargs = {"model_path": "/fake/start.waste"}
+        self.server_kwargs = self.server_kwargs_for(self.usable)
+        ServerTestCase.setUp(self)
+
+    def test_a_resident_without_a_budget_is_measured_from_the_context(self):
+        """FakeEngine reports floor 4 + cache 1, so a resident that chose
+        its own budget counts as 5 — the same figures waste_memory_used
+        returns for a real one."""
+        self.assertEqual(self.server.engine_budget(self.engine), 5)
+
+    def test_a_container_without_a_budget_is_priced_by_its_plan(self):
+        from serve import api as api_mod
+        with self.assertRaises(api_mod.APIError) as cm:
+            self.server.load_model("swap-a")
+        self.assertEqual(cm.exception.status, 507)
+        self.assertEqual(cm.exception.type, "insufficient_memory")
+        message = str(cm.exception)
+        self.assertIn("8 B", message)           # recommended, from the plan
+        self.assertIn("5 B", message)           # the resident, measured
+        self.assertIn("13 B", message)          # against 12 B usable
+        self.assertEqual(self.made, [])
+
+    def test_the_same_load_fits_a_slightly_larger_machine(self):
+        srv = serve(self.engine, host="127.0.0.1", port=0,
+                    model_id="test-model", log_requests=False,
+                    **self.server_kwargs_for(self.usable + 1))
+        self.addCleanup(srv.server_close)
+        self.assertEqual(srv.load_model("swap-a"), "test-model")
+        self.assertEqual(len(self.made), 1)
+
+
+
+
+
 # A test-only engine that turns the request-vs-swap interleaving from a
 # scheduler race into a certainty: the first acquire of its lock performs
 # the swap before the lock is granted, so the request that snapshots the

@@ -27,6 +27,40 @@ changed. Each entry names the section to read for the numbers behind it.
 
 ### Added
 
+- **`--models` now has to prove its swap fits, and a load that would not
+  is a 507.** A swap opens the new container before closing the old one —
+  the order that makes a failed open leave the server serving what it was
+  serving — so two contexts are resident at once, and `docs/SERVE.md`
+  asked the operator to size `--budget` so that moment fits while nothing
+  checked. The default made it worse than "the sum of the two": with
+  `--budget 0` each context sizes itself to as much as 3/4 of
+  `waste_usable_ram()`, so a swap ran at ~1.5x what the process may use —
+  a paging run, not a slow one.
+
+  `--models` now requires an explicit `--budget`, and the server refuses
+  to start unless `2 x budget` fits, naming the largest budget that does;
+  the same lines are printed under the startup banner and by `--plan`,
+  which is where a budget gets chosen. At runtime the resident set is
+  counted at every load — each engine's budget, or the floor and expert
+  cache `waste_memory_used` reports for one that chose its own — and a
+  load that would not fit is refused with **507**
+  (`insufficient_memory`) *before* the container is opened: nothing is
+  closed, nothing is half-loaded, the previous model keeps serving, and
+  the message says what it needed next to what was already held. 507
+  rather than 503 because asking again cannot help.
+
+  That is also what bounds `--keep-previous`, whose resident set grows
+  with every model ever switched to and which no startup check can price
+  in advance: the cap is derived from the budgets rather than from a
+  separate `--max-resident` count that could disagree with them, and a
+  slot move to a model that is already resident is never refused because
+  it allocates nothing. Evicting a resident model to make room was the
+  alternative and is not done — changing what is resident behind a
+  client's back is the failure `--keep-previous` exists to prevent.
+
+  `serve/` goes to 144 server tests (from 135) plus a new
+  `tests/serve/test_main.py` of 12, for the arithmetic on its own.
+
 - **A strict CI job for the K2 tool protocol**, the one GLM has had and
   which `ci.yml` used to have to exempt K2 from in so many words: "the same
   ground-truth rule the K2 template check in tests/run.sh applies, except
