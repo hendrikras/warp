@@ -572,24 +572,30 @@ class ChatServer(ThreadingHTTPServer):
             with previous_engine.lock:
                 if resident is not None:
                     self._detect(resident, model_id)
-                    return previous_slot.model_id
-                # Room for it, before a byte of it is allocated — and
-                # before anything is closed, so a refusal here is
-                # indistinguishable from never having been asked: same
-                # current model, same resident set, same open containers.
-                self.check_room(model_id, path)
-                try:
-                    engine = self.engine_factory(path)
-                except EngineError as e:
-                    raise ModelLoadError(
-                        f"could not load {model_id}: {e}") from e
-                self._detect(engine, model_id)
-                self.engines[model_id] = engine
-                if self.keep_previous:
-                    return previous_slot.model_id
-                self.engines.pop(previous_slot.model_id)
-                previous_engine.close()
-                return previous_slot.model_id
+                    prev = previous_slot.model_id
+                else:
+                    # Room for it, before a byte of it is allocated — and
+                    # before anything is closed, so a refusal here is
+                    # indistinguishable from never having been asked: same
+                    # current model, same resident set, same open containers.
+                    self.check_room(model_id, path)
+                    try:
+                        engine = self.engine_factory(path)
+                    except EngineError as e:
+                        raise ModelLoadError(
+                            f"could not load {model_id}: {e}") from e
+                    self._detect(engine, model_id)
+                    self.engines[model_id] = engine
+                    if not self.keep_previous:
+                        self.engines.pop(previous_slot.model_id)
+                        previous_engine.close()
+                    prev = previous_slot.model_id
+                err = self._slot.chat_error
+                line = f"swap: {model_id}"
+                if err:
+                    line += f"  chat_error: {err}"
+                sys.stderr.write(f"{line}\n")
+                return prev
 
     def _current(self) -> tuple:
         """(the current ModelSlot, its engine). Call with _slot_lock held."""

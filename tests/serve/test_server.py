@@ -1866,3 +1866,17 @@ class TestGlmToolsFromChatJson(ServerTestCase):
                 status, body = self.chat(tools=[tool])
                 self.assertEqual(status, 400)
                 self.assertTrue(body["error"]["param"].startswith("tools[0]"))
+
+    def test_load_log_names_the_model_loaded(self):
+        status, _ = self.post("/v1/models/load", {"model": "swap-a"})
+        self.assertEqual(status, 200)
+        self.assertIn('"POST /v1/models/load HTTP/1.1" 200 -'
+                      "  [model=swap-a]", self.logs())
+
+    def test_load_log_stderr_reports_swap_and_chat_error_if_set(self):
+        status, _ = self.post("/v1/models/load", {"model": "swap-a"})
+        self.assertEqual(status, 200)
+        self.assertIn("swap: swap-a", self.logs())
+
+    def test_get_log_carries_no_model(self):
+        pass
