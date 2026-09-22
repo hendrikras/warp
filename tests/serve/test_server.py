@@ -415,14 +415,24 @@ class TestValidation(ServerTestCase):
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["param"], "messages")
 
-    def test_unknown_model_outranks_missing_messages(self):
-        # The model is validated before the request's shape, the way the
-        # OpenAI API does: a client pointed at a model this server does
-        # not serve should hear "no such model", not a complaint about
-        # messages it would have sent correctly to the right server.
+    def test_unknown_model_without_a_registry_is_served(self):
+        # A single-container server has no registry to be strict about:
+        # its id defaults to the container's file name, and clients send
+        # a fixed model name they cannot easily change — `serve --help`'s
+        # own example sends "waste". Any name is served by the loaded
+        # model, as it was before --models existed.
+        status, body = self.chat(model="waste")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["model"], "test-model")
+
+    def test_unknown_model_does_not_outrank_missing_messages(self):
+        # With no registry there is no model validation at all, so the
+        # request's own shape is the first thing refused. The ordering
+        # the OpenAI API uses — model before shape — is what having a
+        # registry buys; TestModelSwap holds that test.
         status, body = self.post("/v1/chat/completions", {"model": "m"})
-        self.assertEqual(status, 404)
-        self.assertEqual(body["error"]["param"], "model")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["param"], "messages")
 
     def test_empty_messages(self):
         status, body = self.post("/v1/chat/completions", {"messages": []})
@@ -897,6 +907,8 @@ class TestRequestLogs(ServerTestCase):
                       "  [model=swap-a]", self.logs())
 
     def test_chat_log_names_the_model_a_404_refused(self):
+        # This class starts with --models, so a foreign name is a 404 and
+        # the line names what was refused.
         status, _ = self.post("/v1/chat/completions",
                               {"model": "nope",
                                "messages": [{"role": "user", "content": "x"}]})
@@ -999,6 +1011,21 @@ class TestModelSwap(ServerTestCase):
         status, body = self.chat(model="nope")
         self.assertEqual(status, 404)
         self.assertEqual(body["error"]["type"], "not_found_error")
+
+    def test_unknown_model_outranks_missing_messages(self):
+        # The model is validated before the request's shape, the way the
+        # OpenAI API does: a client pointed at a model this server does
+        # not serve should hear "no such model", not a complaint about
+        # messages it would have sent correctly to the right server.
+        status, body = self.post("/v1/chat/completions", {"model": "m"})
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["param"], "model")
+
+    def test_completions_rejects_unknown_model(self):
+        status, body = self.post("/v1/completions",
+                                 {"model": "nope", "prompt": "hi"})
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["param"], "model")
 
     def test_generation_accepts_loaded_model_after_swap(self):
         status, _ = self.load("swap-a")

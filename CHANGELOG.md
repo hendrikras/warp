@@ -12,6 +12,21 @@ changed. Each entry names the section to read for the numbers behind it.
 
 ### Fixed
 
+- **A single-container server serves any model name again.** The model
+  registry made `check_model_request` strict for every deployment: with
+  no `--models`, the registry holds only the loaded model, so a request
+  naming anything else was a 404 — including the fixed name most OpenAI
+  clients are configured with and the `"model": "waste"` example in
+  `serve --help` itself, neither of which a client can easily change.
+  The server's own id defaults to the container's file name
+  (`k3.waste` → `k3`), so even the "correct" name was one most clients
+  did not know. What an existing deployment guaranteed was "any name is
+  answered by the one container"; that is restored: absent, the loaded
+  id, or any other string all serve. Strict validation — a 404 for a
+  name the registry does not know, a 409 for one it knows but has not
+  loaded — is what `--models` opts into, and is unchanged there. Tests
+  for both behaviours in `tests/serve/test_server.py`.
+
 - **The K2 tool-grammar check defaulted to a path on an external volume**,
   which is a description of one machine rather than a default: everywhere
   else — CI, a fresh clone, this machine with the disk unplugged — it read

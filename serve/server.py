@@ -368,15 +368,30 @@ class ChatServer(ThreadingHTTPServer):
 
         Absent, empty, or equal to the loaded model's id: fine — that is
         what every client that does not know about this registry sends,
-        and it must keep working. A name the registry does not know is a
-        404: before the registry existed any name was silently served by
-        the loaded model, which made `model` a decorative string. A name
-        the registry knows but that is not resident is a 409, not a
-        surprise multi-gigabyte swap in the middle of a conversation —
-        the client asks for that explicitly with POST /v1/models/load.
+        and it must keep working. With a registry — `--models` was given —
+        a name it does not know is a 404: before the registry existed any
+        name was silently served by the loaded model, which made `model`
+        a decorative string, and an operator who names a swappable set
+        has said a wrong name should say so rather than answer as another
+        model. A name the registry knows but that is not resident is a
+        409, not a surprise multi-gigabyte swap in the middle of a
+        conversation — the client asks for that explicitly with
+        POST /v1/models/load.
+
+        Without `--models` the registry holds only the loaded model, and
+        nothing here rejects anything: a single-container server has no
+        swappable set to defend, its id defaults to the container's file
+        name, and clients — including the example in `serve --help` —
+        send a fixed model name they cannot easily change. Validating
+        every name would 404 deployments that answered them yesterday;
+        strict validation is what `--models` opts into.
         """
         mid = body.get("model")
         if not isinstance(mid, str) or not mid or mid == self.model_id:
+            return
+        # No --models, no registry to be strict about: the only entry is
+        # the loaded model itself, so anything named is served by it.
+        if len(self.registry) < 2:
             return
         if mid not in self.registry:
             raise api.APIError(f"no such model: {mid}", status=404,

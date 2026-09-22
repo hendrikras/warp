@@ -321,13 +321,17 @@ the answer.
 
 ### Swapping models
 
-By default the process serves the one container it was started with, and a
-request naming any other model is a 404 — before the registry existed any
-name was silently served by the loaded model, which made `model` a
-decorative string.
+By default the process serves the one container it was started with, and
+a request may name it by any model string: absent, the container's own
+id — the file name, `k3.waste` → `k3` — or anything else a client sends,
+including the fixed name most OpenAI clients are configured with. There
+is nothing to be strict about until there is a set to be strict against.
 
-`--models PATH[=ID]` (repeatable) registers additional containers a client
-may switch to:
+`--models PATH[=ID]` (repeatable) registers additional containers a
+client may switch to, and opts into strict validation: a request naming a
+model the registry does not know is a 404, rather than being silently
+served by the loaded model, which is what made `model` a decorative
+string before the registry existed.
 
     python3 -m serve ~/models/k3.waste \
         --models ~/models/glm53.waste --models ~/models/deepseek41.waste=ds41
