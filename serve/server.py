@@ -396,6 +396,11 @@ class ChatServer(ThreadingHTTPServer):
         if mid not in self.registry:
             raise api.APIError(f"no such model: {mid}", status=404,
                                type="not_found_error", param="model")
+        if mid in self.engines:
+            raise api.APIError(
+                f"model {mid} is resident but not the model being served; "
+                f"POST /v1/models/load to switch to it",
+                status=409, type="model_not_loaded", param="model")
         raise api.APIError(
             f"model {mid} is registered but not loaded; POST /v1/models/load "
             f"to switch to it", status=409, type="model_not_loaded",
@@ -763,12 +768,19 @@ class Handler(BaseHTTPRequestHandler):
     def _models(self):
         srv = self.server
         # The whole registry, current model first, so a client scanning the
-        # list sees what is resident before what is only available. A
-        # registered-but-not-loaded entry carries no `waste` shape: its
-        # per-container facts are unknown until it is opened.
+        # list sees what is resident before what is only available. `loaded`
+        # is residency — the same set the load response reports: a model
+        # `--keep-previous` still holds a waste_ctx for is loaded, whether
+        # or not it is the one being served. Only the current entry carries
+        # a `waste` shape: the per-model facts live on the current slot and
+        # move with it, and a resident-but-idle engine's shape is re-derived
+        # when a swap makes it current again. A registered-but-never-opened
+        # container is loaded=false and carries no shape — its facts are
+        # unknown until it is opened.
         data = [api.model_object(srv.model_id, srv.started,
                                  srv.model_info, loaded=True)]
-        data += [api.model_object(mid, srv.started, None, loaded=False)
+        data += [api.model_object(mid, srv.started, None,
+                                  loaded=mid in srv.engines)
                  for mid in sorted(srv.registry)
                  if mid != srv.model_id]
         self._send_json(200, {"object": "list", "data": data})
@@ -782,8 +794,10 @@ class Handler(BaseHTTPRequestHandler):
         if model_id not in srv.registry:
             raise api.APIError(f"no such model: {model_id}", status=404,
                                type="not_found_error", param="model")
-        self._send_json(200, api.model_object(model_id, srv.started,
-                                              None, loaded=False))
+        # Residency, as in _models — with --keep-previous a model the
+        # server has swapped away from is still open and answers loaded.
+        self._send_json(200, api.model_object(model_id, srv.started, None,
+                                              loaded=model_id in srv.engines))
 
     def _load_model(self):
         """POST /v1/models/load — swap the model this server serves.

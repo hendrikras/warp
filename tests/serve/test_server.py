@@ -1002,6 +1002,19 @@ class TestModelSwap(ServerTestCase):
         self.assertEqual(body["id"], "swap-b")
         self.assertEqual(body["loaded"], False)
 
+    def test_swapped_away_model_entry_says_not_loaded(self):
+        """Without --keep-previous a swap closes the previous engine and
+        drops it from `engines` — its entry is a container that is no
+        longer resident, the same as one never opened."""
+        self.load("swap-a")
+        status, body = self.get("/v1/models/test-model")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["loaded"], False)
+        status, body = self.get("/v1/models")
+        by_id = {m["id"]: m for m in body["data"]}
+        self.assertEqual(by_id["test-model"]["loaded"], False)
+        self.assertEqual(by_id["swap-a"]["loaded"], True)
+
     def test_generation_rejects_registered_but_not_loaded(self):
         status, body = self.chat(model="swap-b")
         self.assertEqual(status, 409)
@@ -1132,6 +1145,51 @@ class TestModelSwapKeepPrevious(TestModelSwap):
         self.assertFalse(self.engine.closed)
         self.assertEqual(sorted(self.server.engines),
                          ["swap-a", "test-model"])
+
+    def test_models_reports_resident_models_as_loaded(self):
+        """`loaded` is residency, the same thing the load response reports:
+        a model --keep-previous still holds a waste_ctx for answers
+        loaded=True even after the swap made another model current. It was
+        listed loaded=false, indistinguishable from a container that was
+        never opened, while /v1/models/load counted it as resident."""
+        self.load("swap-a")
+        status, body = self.get("/v1/models")
+        self.assertEqual(status, 200)
+        by_id = {m["id"]: m for m in body["data"]}
+        self.assertEqual(by_id["test-model"]["loaded"], True)
+        self.assertEqual(by_id["swap-a"]["loaded"], True)
+        self.assertEqual(by_id["swap-b"]["loaded"], False)
+        self.assertNotIn("waste", by_id["test-model"])  # resident, not current:
+        # the shape moves with the current slot and is re-derived on the
+        # slot move that would make it serve again.
+        self.assertIn("waste", by_id["swap-a"])
+        # The current model still leads the list.
+        self.assertEqual(body["data"][0]["id"], "swap-a")
+
+    def test_swapped_away_model_entry_says_not_loaded(self):
+        """Overridden: with --keep-previous the swapped-away model is not
+        out of the resident set — its entry says loaded, as
+        test_resident_model_entry_says_loaded asserts per id."""
+        status, body = self.get("/v1/models")
+        by_id = {m["id"]: m for m in body["data"]}
+        self.assertEqual(by_id["test-model"]["loaded"], True)
+
+    def test_resident_model_entry_says_loaded(self):
+        self.load("swap-a")
+        status, body = self.get("/v1/models/test-model")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["id"], "test-model")
+        self.assertEqual(body["loaded"], True)
+
+    def test_generation_naming_a_resident_model_says_so(self):
+        """The 409 for a model that is resident but not current does not
+        call it \"not loaded\" — that was true only before the swap and is
+        the same lie the registry listing told."""
+        self.load("swap-a")
+        status, body = self.chat(model="test-model")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["type"], "model_not_loaded")
+        self.assertIn("resident", body["error"]["message"])
 
     def test_can_switch_back_without_reopening(self):
         """swap-a was never closed, so loading it again is a slot move,

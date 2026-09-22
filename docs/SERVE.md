@@ -268,7 +268,7 @@ transcribed in this repo. That is what is left of
 | endpoint | notes |
 |---|---|
 | `GET /health` | liveness; never requires the API key |
-| `GET /v1/models`, `GET /v1/models/{id}` | the registry: the loaded model (its real shape under a `waste` key), plus any registered-but-not-loaded containers with `"loaded": false` |
+| `GET /v1/models`, `GET /v1/models/{id}` | the registry: `loaded` is residency — with `--keep-previous`, a model the server has swapped away from answers `loaded: true` too. The model being served is listed first and is the only entry with its real shape under a `waste` key |
 | `POST /v1/models/load` | swap models; see "Swapping models" below |
 | `POST /v1/chat/completions` | streaming and not, tools, images |
 | `POST /v1/completions` | raw continuation, no chat template |

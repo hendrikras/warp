@@ -12,6 +12,23 @@ changed. Each entry names the section to read for the numbers behind it.
 
 ### Fixed
 
+- **`"loaded"` on `GET /v1/models` now means residency, as
+  `POST /v1/models/load` already said it did.** The registry listing set
+  `loaded: true` only for the model being served, so under
+  `--keep-previous` a model the server still holds an open `waste_ctx`
+  for was listed `loaded: false` — indistinguishable from a container
+  that was never opened — while the load response's `models` field
+  counted it as resident, and a generation naming it was refused as "not
+  loaded". The two endpoints now agree: `loaded` is `mid in engines`,
+  the same set the load response reports, and `GET /v1/models/{id}` says
+  the same for one entry. The 409 for a model that is resident but not
+  current says "resident but not the model being served" rather than
+  "registered but not loaded"; the `model_not_loaded` type and status
+  are unchanged. The `waste` shape still travels only on the current
+  entry — the per-model facts move with the current slot and are
+  re-derived when a swap makes a resident model current again. Tests in
+  `tests/serve/test_server.py`.
+
 - **A single-container server serves any model name again.** The model
   registry made `check_model_request` strict for every deployment: with
   no `--models`, the registry holds only the loaded model, so a request
