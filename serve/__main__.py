@@ -286,11 +286,13 @@ examples:
                         "contexts need together is the sum of their "
                         "budgets, and on the machines this engine targets "
                         "that is the difference between working and "
-                        "paging. Both models can then answer at once — "
-                        "each waste_ctx takes one caller, so each has its "
-                        "own lock. Every model switched to stays resident, "
-                        "so the load that would put the set over the "
-                        "machine's RAM is refused with 507")
+                        "paging. Generation still serves only the current "
+                        "model — each waste_ctx takes one caller — but "
+                        "switching back to a resident one is a slot move "
+                        "instead of a reopen of a multi-gigabyte "
+                        "container. Every model switched to stays "
+                        "resident, so the load that would put the set "
+                        "over the machine's RAM is refused with 507")
     s.add_argument("--plan", action="store_true",
                    help="print the memory plan and exit without loading")
     s.add_argument("--no-log-requests", action="store_true",
@@ -300,6 +302,11 @@ examples:
                         "is how you find out which one answered")
 
     args = ap.parse_args(argv)
+
+    if args.usage and args.models:
+        print("--usage cannot be used with --models: a learned hotlist is "
+              "specific to one container", file=sys.stderr)
+        return 2
 
     model = Path(args.model).expanduser()
     if not model.exists():

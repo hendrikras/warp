@@ -17,20 +17,36 @@ test_server.py.
 
     python3 tests/serve/test_main.py
 """
-
+import io
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from serve.__main__ import (RegistryBudgetError, check_registry_budget,
-                            describe_registry, human)
+                            describe_registry, human, main)
 from serve.engine import EngineError
 
 GB = 1 << 30
 MODELS = {"glm53": "/fake/glm53.waste", "ds41": "/fake/ds41.waste"}
 
+class TestHumanBytes(unittest.TestCase):
+    def test_units(self):
+        self.assertEqual(human(0), "0 B")
+        self.assertEqual(human(1024), "1.0 KB")
+        self.assertEqual(human(3 * GB), "3.0 GB")
+        self.assertEqual(human(2 * (1 << 40)), "2.0 TB")
+
+
+class TestUsageWithModels(unittest.TestCase):
+    def test_usage_with_models_is_refused(self):
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr):
+            rc = main(["dummy.waste", "--models", "other.waste", "--usage", "hotlist.waste"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--usage cannot be used with --models", stderr.getvalue())
 
 class TestRegistryBudget(unittest.TestCase):
     """--models is refused unless --budget shows that 2 x budget fits."""
