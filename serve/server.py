@@ -114,37 +114,6 @@ class ModelSlot(NamedTuple):
         construction) no request can have arrived yet.
         """
         default_thinking = start_thinking
-class ChatServer(ThreadingHTTPServer):
-    """Threaded HTTP, one engine, one lock."""
-
-    daemon_threads = True
-    allow_reuse_address = True
-    # socketserver's listen backlog is 5. Every request holds the engine
-    # lock for a whole generation, so clients arrive in bursts that all
-    # connect before the accept loop drains them, and a burst of 8 (what
-    # TestConcurrency sends) overflowed it: macOS 27 answered the surplus
-    # connects with a reset, and the test failed about half its runs. 128
-    # is macOS's default somaxconn, so a larger value would be clipped.
-    request_queue_size = 128
-
-    def __init__(self, addr, handler, *, engine: Engine, model_id: str,
-                 api_key: Optional[str] = None,
-                 default_max_tokens: int = 4096,
-                 default_thinking: bool = True,
-                 allow_local_images: bool = False,
-                 log_requests: bool = True,
-                 tmpdir: Optional[str] = None):
-        super().__init__(addr, handler)
-        self.engine = engine
-        self.model_id = model_id
-        self.api_key = api_key
-        self.default_max_tokens = default_max_tokens
-        self.default_thinking = default_thinking
-        self.allow_local_images = allow_local_images
-        self.log_requests = log_requests
-        self.started = api.now()
-        self._tmp = tmpdir or tempfile.mkdtemp(prefix="waste-serve-")
-        self.tmpdir = self._tmp
         try:
             model_info = engine.model_info()
         except EngineError:
@@ -252,6 +221,13 @@ class ChatServer(ThreadingHTTPServer):
 
     daemon_threads = True
     allow_reuse_address = True
+    # socketserver's listen backlog is 5. Every request holds the engine
+    # lock for a whole generation, so clients arrive in bursts that all
+    # connect before the accept loop drains them, and a burst of 8 (what
+    # TestConcurrency sends) overflowed it: macOS 27 answered the surplus
+    # connects with a reset, and the test failed about half its runs. 128
+    # is macOS's default somaxconn, so a larger value would be clipped.
+    request_queue_size = 128
 
     def __init__(self, addr, handler, *, engine: Engine, model_id: str,
                  api_key: Optional[str] = None,
