@@ -40,6 +40,7 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, NamedTuple, Optional
 
@@ -231,6 +232,7 @@ class ChatServer(ThreadingHTTPServer):
 
     def __init__(self, addr, handler, *, engine: Engine, model_id: str,
                  api_key: Optional[str] = None,
+                 auto_register: bool = False,
                  default_max_tokens: int = 4096,
                  default_thinking: bool = True,
                  allow_local_images: bool = False,
@@ -262,6 +264,7 @@ class ChatServer(ThreadingHTTPServer):
         # an open costs nothing next to the open.
         self.memory_plan = memory_plan or plan_memory
         self.keep_previous = keep_previous
+        self.auto_register = auto_register
         self.engine_factory = engine_factory or self._default_engine_factory
         self._slot_lock = threading.RLock()
         # model_id -> the Engine holding it. With keep_previous there can be
@@ -276,6 +279,12 @@ class ChatServer(ThreadingHTTPServer):
         self.registry = {model_id: engine.model_path or model_id}
         for mid, path in (models or {}).items():
             self.registry.setdefault(mid, path)
+        # Whether POST /v1/models/load may register a path it has not seen
+        # before, rather than refusing any id outside --models. Off by
+        # default for the reason --allow-local-images is: without it, any
+        # client that can reach this port could make the server open an
+        # arbitrary file on its own filesystem.
+        self.api_key = api_key
         self.api_key = api_key
         self.default_max_tokens = default_max_tokens
         self.allow_local_images = allow_local_images
@@ -413,6 +422,42 @@ class ChatServer(ThreadingHTTPServer):
             f"to switch to it", status=409, type="model_not_loaded",
             param="model")
 
+    def register_path(self, path: str, model_id: Optional[str] = None) -> str:
+        """Add a container to the registry by its pathname, and return the
+        id it was given. Only reachable when this server was started with
+        --auto-register.
+
+        `model_id` defaults the way --models PATH[=ID] does: the file name
+        with the .waste suffix removed. Registering the same path again
+        under the same id is a no-op; registering a *different* path under
+        an id already taken is refused — the same duplicate-id protection
+        parse_registry gives the CLI's --models, because two containers
+        behind one name means a caller's "load this model" sometimes loads
+        a different one than it just listed.
+
+        This only edits the registry. Whether the load then fits next to
+        what stays resident is check_room's question, asked by load_model
+        exactly as it is for any other registered id.
+        """
+        p = Path(path).expanduser()
+        if not p.exists():
+            raise api.APIError(f"no such container: {p}", status=404,
+                               type="not_found_error", param="path")
+        mid = model_id or p.name.removesuffix(".waste")
+        if not mid:
+            raise api.APIError(
+                "could not derive a model id from this path; give one "
+                "explicitly with 'model'", param="path")
+        existing = self.registry.get(mid)
+        if existing is not None and existing != str(p):
+            raise api.APIError(
+                f"model id {mid} is already registered to {existing}; give "
+                f"an explicit 'model' id to register {p} under a "
+                f"different name", status=409, type="model_conflict",
+                param="model")
+        self.registry[mid] = str(p)
+        return mid
+
     # ---- what the machine has room for -----------------------------------
     #
     # A swap holds two contexts at once: the new container is opened before
@@ -463,15 +508,23 @@ class ChatServer(ThreadingHTTPServer):
                    + used.get("min_expert_cache", 0))
 
     def planned_budget(self, path: str) -> int:
-        """What a container would ask for when no --budget is configured.
+        """What a container needs at minimum, when no --budget is configured.
 
-        A prediction, and named one. With 0 the engine walks its own ladder
-        — floor plus whole expert working sets, under 3/4 of usable RAM —
-        and nothing here can run that ladder without opening the container.
-        It uses the ladder's own definition of "worth having",
-        recommended_bytes, which is the number waste_plan_memory exists to
-        give. The CLI never relies on this: --models requires an explicit
-        --budget, so every figure on that path is exact.
+        With ram_budget_bytes 0 the engine does not insist on its ideal cache
+        size: waste_open sizes itself to whatever fits under ~3/4 of
+        waste_usable_ram, taking a smaller cache on a tighter machine rather
+        than refusing to open. So the figure this check needs is not "what
+        it would ideally take" — recommended_bytes — but "the least it can
+        run with": floor_bytes, the resident trunk and state before a single
+        expert is cached. Pricing at the recommended figure would refuse a
+        load the engine, sizing itself down, would have opened fine.
+
+        A prediction, and named one: nothing here can run the ladder without
+        opening the container, so this reads only the manifest through
+        waste_plan_memory. The CLI never relies on this — --models requires
+        an explicit --budget, so every figure on that path is exact; this is
+        what a load with no budget is priced by instead, including one
+        registered on the fly by --auto-register.
         """
         try:
             ctx = int(self.engine_kwargs.get("ctx_tokens") or 0)
@@ -816,6 +869,20 @@ class Handler(BaseHTTPRequestHandler):
         """POST /v1/models/load — swap the model this server serves.
 
         Body: {"model": "<id>"} where id is a name from GET /v1/models.
+        With --auto-register, {"path": "<pathname>"} may name a container
+        this server has not seen before instead — the id defaults to the
+        file name without .waste, or the caller's own "model" if it gives
+        one. The path is registered first, then loaded exactly like any
+        other registry entry: the same check_room budget accounting and
+        open-before-close rollback apply, because load_model does not know
+        or care how an id got into the registry.
+
+        The swap happens under the current engine's lock, so a generation
+        in flight finishes first; the reply says which model went out and
+        which came in. Errors: 404 unknown id or path, 409 a path id
+        collision, 500 (ModelLoadError) the container would not open, 507
+        the load would not fit next to what stays resident — the previous
+        model is still served in every case.
         The swap happens under the current engine's lock, so a generation
         in flight finishes first; the reply says which model went out and
         which came in. Errors: 404 unknown id, 500 (ModelLoadError) the
@@ -1048,7 +1115,7 @@ class Handler(BaseHTTPRequestHandler):
                             "index": i, "id": call.id or f"call_{i + 1}",
                             "type": "function",
                             "function": {"name": call.name, "arguments": ""},
-                        }]}))
+                        }}]))
             except (BrokenPipeError, ConnectionResetError):
                 raise Cancelled()
 
@@ -1070,12 +1137,12 @@ class Handler(BaseHTTPRequestHandler):
                             "index": i, "id": call.id or f"call_{i + 1}",
                             "type": "function",
                             "function": {"name": call.name, "arguments": ""},
-                        }]}))
+                        }}))
                 write(api.chunk(request_id, created, model, {
                     "tool_calls": [{
                         "index": i,
                         "function": {"arguments": call.arguments_json()},
-                    }]}))
+                    }}))
 
             reason = api.finish_reason(parser, hit_limit=hit_limit,
                                        stopped=stopped)
@@ -1177,6 +1244,7 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
           allow_local_images: bool = False, log_requests: bool = True,
           ready: Optional[threading.Event] = None,
           models: Optional[dict] = None, keep_previous: bool = False,
+          auto_register: bool = False,
           engine_kwargs: Optional[dict] = None,
           engine_factory: Optional[Callable] = None,
           usable_ram: Optional[int] = None,
@@ -1185,10 +1253,12 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
 
     models names the rest of the swappable registry (id -> container
     path); keep_previous decides whether a swap unloads the model it
-    replaces; engine_kwargs is how the default factory opens a container
-    on a swap — the same arguments the startup engine was opened with —
-    and engine_factory replaces that factory wholesale, for a host that
-    builds engines its own way (tests do exactly that).
+    replaces; auto_register lets POST /v1/models/load register a path it
+    has not seen before instead of refusing any id outside models;
+    engine_kwargs is how the default factory opens a container on a swap —
+    the same arguments the startup engine was opened with — and
+    engine_factory replaces that factory wholesale, for a host that builds
+    engines its own way (tests do exactly that).
 
     usable_ram is what the resident-set check counts against — pass the
     figure already measured so a load never probes for it — and
@@ -1206,9 +1276,44 @@ def serve(engine: Engine, *, host: str = "127.0.0.1", port: int = 8000,
                      allow_local_images=allow_local_images,
                      log_requests=log_requests, models=models,
                      keep_previous=keep_previous,
-                     engine_kwargs=engine_kwargs,
+                     auto_register=auto_register,
+                     engine_kwargs={
+                         "user": "user_name",
+                         "path": "/path/to/container",
+                         "log": True,
+                         "optimize": True 
+                     },
                      engine_factory=engine_factory,
-                     usable_ram=usable_ram, memory_plan=memory_plan)
+                     usable_ram=usable, memory_plan=memory_plan)
     if ready is not None:
         ready.set()
     return srv
+
+        s.add_argument("--keep-previous", action="store_true",
+                       help="keep a model resident when another is loaded. "
+                            "Off by default, and deliberately: the RAM two "
+                            "contexts need together is the sum of their "
+                            "budgets, and on the machines this engine targets "
+                            "that is the difference between working and "
+                            "paging. Generation still serves only the current "
+                            "model — each waste_ctx takes one caller — but "
+                            "switching back to a resident one is a slot move "
+                            "instead of a reopen of a multi-gigabyte "
+                            "container. Every model switched to stays "
+                            "resident, so the load that would put the set "
+                            "over the machine's RAM is refused with 507")
+        s.add_argument("--auto-register", action="store_true",
+                       help="let POST /v1/models/load register a container "
+                            "by pathname it has not seen before, instead of "
+                            "refusing any id outside --models. Off by "
+                            "default: any client that can reach this port "
+                            "could otherwise make it open an arbitrary file "
+                            "on this machine — the same reason "
+                            "--allow-local-images is off by default. The id "
+                            "defaults to the file name without .waste, or "
+                            "the caller's own 'model' if it gives one; the "
+                            "load is still priced against --budget (or, "
+                            "with none, the container's floor) and refused "
+                            "with 507 if it would not fit")
+        s.add_argument("--plan", action="store_true",
+                       help="print the memory plan and exit without loading")
