@@ -606,47 +606,77 @@ class ChatServer(ThreadingHTTPServer):
         container. The per-model facts move with the slot: one assignment
         publishes engine, format, markers, stop tokens and thinking
         default together, so no reader can see a half-updated set.
+
+        Lock order is engine first, slot second — here as everywhere else.
+        A generation takes its engine's lock and only then calls
+        check_engine, which takes _slot_lock. A swap that took _slot_lock
+        first and then waited for the engine lock closes the cycle against
+        a generation in flight: the swap holding the slot and waiting for
+        the engine, the generation holding the engine and waiting for the
+        slot. Since every request path takes _slot_lock, that wedge stops
+        the whole server rather than the two requests in it. So the slot is
+        read and _slot_lock released *before* the engine lock is taken, and
+        re-taken underneath it, where the slot is re-checked: another swap
+        that got there first held this same engine lock, so it moved the
+        slot while neither of ours was held, and this one starts over on
+        the slot as it is now instead of replacing a model already gone.
         """
-        with self._slot_lock:
-            current = self._current()
-            if model_id == current[0].model_id:
-                return None
-            path = self.registry.get(model_id)
-            if path is None:
-                raise api.APIError(f"no such model: {model_id}", status=404,
-                                   type="not_found_error", param="model")
-            previous_slot, previous_engine = current
-            # A model kept resident by keep_previous does not need an
-            # open at all — its waste_ctx still holds the state it had.
-            # Moving the slot to it costs a format re-detect, not a load.
-            resident = self.engines.get(model_id)
+        while True:
+            # Read the slot and decide, then let _slot_lock go before the
+            # engine lock is asked for — see the lock-order note above. The
+            # registry is read here too, so an unknown id is a fast 404
+            # rather than a wait behind whatever generation holds the
+            # engine.
+            with self._slot_lock:
+                previous_slot, previous_engine = self._current()
+                if model_id == previous_slot.model_id:
+                    return None
+                path = self.registry.get(model_id)
+                if path is None:
+                    raise api.APIError(f"no such model: {model_id}", status=404,
+                                       type="not_found_error", param="model")
+            # Only now the engine lock, and _slot_lock again *underneath*
+            # it, the order the rest of this file uses. Re-check first:
+            # a swap that got here first held this same engine lock, so
+            # the slot moved while neither of our locks was held, and
+            # moving it to a target that is already gone is the stale-slot
+            # bug check_engine exists to prevent on the request side.
             with previous_engine.lock:
-                if resident is not None:
-                    self._detect(resident, model_id)
-                    prev = previous_slot.model_id
-                else:
-                    # Room for it, before a byte of it is allocated — and
-                    # before anything is closed, so a refusal here is
-                    # indistinguishable from never having been asked: same
-                    # current model, same resident set, same open containers.
-                    self.check_room(model_id, path)
-                    try:
-                        engine = self.engine_factory(path)
-                    except EngineError as e:
-                        raise ModelLoadError(
-                            f"could not load {model_id}: {e}") from e
-                    self._detect(engine, model_id)
-                    self.engines[model_id] = engine
-                    if not self.keep_previous:
-                        self.engines.pop(previous_slot.model_id)
-                        previous_engine.close()
-                    prev = previous_slot.model_id
-                err = self._slot.chat_error
-                line = f"swap: {model_id}"
-                if err:
-                    line += f"  chat_error: {err}"
-                sys.stderr.write(f"{line}\n")
-                return prev
+                with self._slot_lock:
+                    if self._current()[0] is not previous_slot:
+                        continue
+                    # A model kept resident by keep_previous does not need
+                    # an open at all — its waste_ctx still holds the state
+                    # it had. Moving the slot to it costs a format
+                    # re-detect, not a load.
+                    resident = self.engines.get(model_id)
+                    if resident is not None:
+                        self._detect(resident, model_id)
+                        prev = previous_slot.model_id
+                    else:
+                        # Room for it, before a byte of it is allocated —
+                        # and before anything is closed, so a refusal here
+                        # is indistinguishable from never having been
+                        # asked: same current model, same resident set,
+                        # same open containers.
+                        self.check_room(model_id, path)
+                        try:
+                            engine = self.engine_factory(path)
+                        except EngineError as e:
+                            raise ModelLoadError(
+                                f"could not load {model_id}: {e}") from e
+                        self._detect(engine, model_id)
+                        self.engines[model_id] = engine
+                        if not self.keep_previous:
+                            self.engines.pop(previous_slot.model_id)
+                            previous_engine.close()
+                        prev = previous_slot.model_id
+                    err = self._slot.chat_error
+                    line = f"swap: {model_id}"
+                    if err:
+                        line += f"  chat_error: {err}"
+                    sys.stderr.write(f"{line}\n")
+                    return prev
 
     def _current(self) -> tuple:
         """(the current ModelSlot, its engine). Call with _slot_lock held."""

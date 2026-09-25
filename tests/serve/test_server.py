@@ -1661,6 +1661,139 @@ class TestRequestQueuedBehindSwapKeepPrevious(TestRequestQueuedBehindSwap):
         self.assertEqual(cm.exception.type, "model_switched")
         self.assertFalse(stale.engine.closed)
 
+# The counterpart of RaceOnFirstLockEngine for the other queueing case: it
+# reports the moment a *second* taker asks for the engine lock, which is the
+# swap arriving while a generation holds it.
+
+@dataclasses.dataclass
+class LoadQueuesOnEngineLock(FakeEngine):
+    """Fires `on_load_reaches_the_lock` when the load asks for the lock.
+
+    The first taker is the generation's own `with engine.lock`; the second
+    is the swap, which asks for the engine lock only after it has read the
+    slot and decided what to move it to. That is exactly where the old lock
+    order left the swap holding _slot_lock while it waited here.
+    """
+
+    on_load_reaches_the_lock: Optional[Callable] = None
+
+    def __post_init__(self):
+        self._takers = 0
+
+    @property
+    def lock(self):
+        outer = self
+
+        class _Lock:
+            def acquire(self, *args, **kwargs):
+                outer._takers += 1
+                if outer._takers == 2 and outer.on_load_reaches_the_lock:
+                    outer.on_load_reaches_the_lock()
+                return outer._lock.acquire(*args, **kwargs)
+
+            def release(self):
+                outer._lock.release()
+
+            def __enter__(self):
+                self.acquire()
+
+            def __exit__(self, *exc):
+                self.release()
+        return _Lock()
+
+
+class TestSwapWhileGenerating(ServerTestCase):
+    """A POST /v1/models/load arriving while a request is generating must
+    not wedge the server.
+
+    load_model used to take _slot_lock and then the engine lock, while a
+    generation takes the engine lock and then _slot_lock — check_engine
+    reads the slot under the lock it is already holding. A load arriving
+    mid-generation closed that cycle: the load holding the slot and waiting
+    for the engine, the generation holding the engine and waiting for the
+    slot. Every request path takes _slot_lock, so the wedge stopped the
+    whole server, not just the two requests in it. The swap now takes the
+    engine lock first and re-reads the slot underneath it, retrying if the
+    slot moved meanwhile.
+
+    RaceOnFirstLockEngine turns the request-queued-behind-a-swap case into a
+    certainty; this does the same for the wedging one. The generation holds
+    the engine lock, the load is started, and the generation only then
+    reads the slot — the read that used to wait forever.
+    """
+
+    log_requests = False
+
+    def setUp(self):
+        self.made: list[FakeEngine] = []
+        self.at_the_lock = threading.Event()
+        self.slot_reads: list = []
+        self.engine = LoadQueuesOnEngineLock(model_path="/fake/start.waste")
+        self.engine.on_load_reaches_the_lock = self.at_the_lock.set
+        self.server = serve(self.engine, host="127.0.0.1", port=0,
+                            model_id="test-model",
+                            log_requests=False,
+                            models={"swap-a": "/fake/a.waste"},
+                            engine_factory=self.make_engine)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+
+    def make_engine(self, path: str) -> FakeEngine:
+        engine = FakeEngine(model_path=path)
+        self.made.append(engine)
+        return engine
+
+    def test_a_load_while_generating_does_not_wedge_the_server(self):
+        srv = self.server
+        generating = threading.Event()
+        failures: list = []
+        answers: list = []
+
+        def generation():
+            # What _chat holds across build_prompt and generate.
+            with self.engine.lock:
+                generating.set()
+                if not self.at_the_lock.wait(5):
+                    failures.append("the load never reached the engine lock")
+                    return
+                # Still under the engine lock, with the load queued behind
+                # it: this is the read that had to wait for the load, which
+                # was itself waiting for this lock.
+                self.slot_reads.append(srv.current_slot())
+
+        def load():
+            answers.append(self.post("/v1/models/load", {"model": "swap-a"}))
+
+        gen = threading.Thread(target=generation, daemon=True)
+        gen.start()
+        self.assertTrue(generating.wait(5))
+        loader = threading.Thread(target=load, daemon=True)
+        loader.start()
+
+        gen.join(timeout=10)
+        # Asserted before joining the load: the load cannot finish while a
+        # wedged generation still holds the engine lock, and a failure here
+        # should report why rather than wait for it.
+        self.assertFalse(gen.is_alive(),
+                         "the generation was wedged by the load in flight")
+        self.assertEqual(failures, [])
+        self.assertEqual(len(self.slot_reads), 1)
+        loader.join(timeout=10)
+        self.assertFalse(loader.is_alive(), "the load never finished")
+        self.assertEqual(len(answers), 1)
+        status, body = answers[0]
+        self.assertEqual(status, 200)
+        self.assertEqual(body["loaded"], "swap-a")
+        # And the swap landed: the slot the generation held is gone, and
+        # the engine it named is the one the load opened.
+        self.assertEqual(srv.current_slot().model_id, "swap-a")
+        self.assertIs(srv.current_slot().engine, self.made[0])
+        self.assertTrue(self.engine.closed)
+
+
+
 
 class TestConcurrency(ServerTestCase):
     def test_parallel_requests_all_answered(self):
