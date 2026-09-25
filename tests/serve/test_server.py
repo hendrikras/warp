@@ -1421,7 +1421,100 @@ class TestSwapMemoryBudgetWithoutABudget(ServerTestCase):
         self.assertEqual(len(self.made), 1)
 
 
+class TestAutoRegister(ServerTestCase):
+    """POST /v1/models/load with a pathname: --auto-register lets the
+    endpoint add an unregistered container to the registry and load it,
+    priced and rolled back exactly like any other registered id.
 
+    Off by default for the reason --allow-local-images is: without it,
+    any client that can reach this port could make the server open an
+    arbitrary file on its own filesystem."""
+
+    auto = False
+
+    def make_engine(self, path: str) -> FakeEngine:
+        engine = FakeEngine(model_path=path, markers=dict(MARKERS))
+        self.made.append(engine)
+        return engine
+
+    def setUp(self):
+        # A real file on disk: register_path refuses a path that does not
+        # exist, and the fake factory opens whatever it is pointed at.
+        self.dir = tempfile.mkdtemp(prefix="serve-auto-register-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.container = Path(self.dir) / "auto.waste"
+        self.container.write_text("not a container; the factory is fake")
+        self.made = []
+        self.engine_kwargs = {"model_path": "/fake/start.waste"}
+        self.server_kwargs = {
+            "models": {"swap-a": "/fake/a.waste"},
+            "auto_register": self.auto,
+            "engine_factory": self.make_engine,
+        }
+        ServerTestCase.setUp(self)
+
+    def load_path(self, path: str, model=None):
+        body = {"path": path}
+        if model is not None:
+            body["model"] = model
+        return self.post("/v1/models/load", body)
+
+    def test_the_flag_gates_path_registration(self):
+        status, body = self.load_path(str(self.container))
+        self.assertEqual(status, 400)
+        self.assertIn("--auto-register", body["error"]["message"])
+        # The refusal is before the registry: nothing was added, and no
+        # engine was built for a path the server never opened.
+        self.assertEqual(sorted(self.server.registry),
+                         ["swap-a", "test-model"])
+        self.assertEqual(self.made, [])
+
+
+class TestAutoRegisterEnabled(TestAutoRegister):
+    auto = True
+
+    def test_the_flag_gates_path_registration(self):
+        # Gate open: the request the base class 400s now registers and
+        # loads, so the flag is what decides.
+        status, body = self.load_path(str(self.container))
+        self.assertEqual(status, 200)
+
+    def test_a_path_registers_and_loads_under_its_derived_id(self):
+        status, body = self.load_path(str(self.container))
+        self.assertEqual(status, 200)
+        # The id is the file name without .waste, as --models PATH[=ID]
+        # derives it.
+        self.assertEqual(body["loaded"], "auto")
+        self.assertEqual(body["previous"], "test-model")
+        self.assertEqual(self.server.registry["auto"], str(self.container))
+        self.assertEqual(self.made[0].model_path, str(self.container))
+
+    def test_an_explicit_id_wins_over_the_derived_one(self):
+        status, body = self.load_path(str(self.container), model="picked")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["loaded"], "picked")
+        self.assertIn("picked", self.server.registry)
+
+    def test_a_path_that_does_not_exist_is_404(self):
+        status, body = self.load_path(str(Path(self.dir) / "nope.waste"))
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["param"], "path")
+        self.assertEqual(self.made, [])
+
+    def test_a_different_path_under_a_taken_id_is_409(self):
+        other = Path(self.dir) / "other.waste"
+        other.write_text("another container")
+        status, body = self.load_path(str(other), model="swap-a")
+        self.assertEqual(status, 409)
+        # The entry the id already names is untouched.
+        self.assertEqual(self.server.registry["swap-a"], "/fake/a.waste")
+
+    def test_the_same_path_again_is_a_noop_registration(self):
+        self.load_path(str(self.container))
+        status, body = self.load_path(str(self.container))
+        self.assertEqual(status, 200)
+        # Already current: load_model reports no previous.
+        self.assertIsNone(body["previous"])
 
 
 # A test-only engine that turns the request-vs-swap interleaving from a
@@ -1770,16 +1863,46 @@ class TestGlmToolsFromChatJson(ServerTestCase):
 
     from tests.serve.test_glmtools import GLM_MARKERS  # noqa: E402
 
+    log_requests = True
+
+    def make_engine(self, path: str) -> FakeEngine:
+        # The swap target is a GLM-family container whose chat.json the
+        # fake path cannot resolve, so its slot carries a chat_error —
+        # what the swap's stderr line reports.
+        return FakeEngine(model_path=path, no_markers=True,
+                          markers=dict(self.GLM_MARKERS))
+
     def setUp(self):
-        self.dir = tempfile.mkdtemp(prefix="serve-glm-tools-")
-        self.addCleanup(shutil.rmtree, self.dir, True)
-        shutil.copyfile(REPO / "examples" / "chat-glm53.json",
-                        Path(self.dir) / "chat.json")
-        self.engine_kwargs = {"no_markers": True, "model_path": self.dir,
-                              "markers": dict(self.GLM_MARKERS)}
-        # GLM's format always opens the reasoning channel, so default the
-        # server to thinking on, which is also the server's default.
-        ServerTestCase.setUp(self)
+        self._captured = io.StringIO()
+        self._ctx = contextlib.redirect_stderr(self._captured)
+        self._ctx.__enter__()
+        try:
+            self.dir = tempfile.mkdtemp(prefix="serve-glm-tools-")
+            self.addCleanup(shutil.rmtree, self.dir, True)
+            shutil.copyfile(REPO / "examples" / "chat-glm53.json",
+                            Path(self.dir) / "chat.json")
+            self.engine_kwargs = {"no_markers": True, "model_path": self.dir,
+                                  "markers": dict(self.GLM_MARKERS)}
+            # GLM's format always opens the reasoning channel, so default
+            # the server to thinking on, which is also the server's default.
+            self.server_kwargs = {
+                "models": {"swap-a": "/fake/a.waste"},
+                "engine_factory": self.make_engine,
+            }
+            ServerTestCase.setUp(self)
+        except BaseException:
+            self._ctx.__exit__(None, None, None)
+            raise
+
+    def tearDown(self):
+        try:
+            ServerTestCase.tearDown(self)
+        finally:
+            self._ctx.__exit__(None, None, None)
+
+    def logs(self) -> str:
+        self._captured.flush()
+        return self._captured.getvalue()
 
     @staticmethod
     def glm_tool_reply():
@@ -1879,4 +2002,6 @@ class TestGlmToolsFromChatJson(ServerTestCase):
         self.assertIn("swap: swap-a", self.logs())
 
     def test_get_log_carries_no_model(self):
-        pass
+        status, _ = self.get("/v1/models")
+        self.assertEqual(status, 200)
+        self.assertNotIn("[model=", self.logs())

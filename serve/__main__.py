@@ -293,6 +293,18 @@ examples:
                         "container. Every model switched to stays "
                         "resident, so the load that would put the set "
                         "over the machine's RAM is refused with 507")
+    s.add_argument("--auto-register", action="store_true",
+                   help="let POST /v1/models/load register a container "
+                        "by pathname it has not seen before, instead of "
+                        "refusing any id outside --models. Off by default: "
+                        "any client that can reach this port could otherwise "
+                        "make it open an arbitrary file on this machine — "
+                        "the same reason --allow-local-images is off by "
+                        "default. The id defaults to the file name without "
+                        ".waste, or the caller's own 'model' if it gives "
+                        "one; the load is still priced against --budget (or, "
+                        "with none, the container's plan) and refused with "
+                        "507 if it would not fit")
     s.add_argument("--plan", action="store_true",
                    help="print the memory plan and exit without loading")
     s.add_argument("--no-log-requests", action="store_true",
@@ -412,6 +424,7 @@ examples:
                     log_requests=not args.no_log_requests,
                     models=registry,
                     keep_previous=args.keep_previous,
+                    auto_register=args.auto_register,
                     usable_ram=usable,
                     engine_kwargs={
                         "ram_budget_bytes": args.budget,
