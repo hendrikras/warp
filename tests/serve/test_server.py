@@ -1517,6 +1517,77 @@ class TestAutoRegisterEnabled(TestAutoRegister):
         self.assertIsNone(body["previous"])
 
 
+class TestAutoRegisterRefusedRollback(TestAutoRegister):
+    """A refused auto-register load must not leave its id registered.
+
+    check_room's 507 arrives after register_path has already edited the
+    registry, so without a rollback one refused request permanently
+    widens the id namespace: a later load-by-id, with no ``path`` in the
+    body, never passes the --auto-register gate a second time. The id
+    this request introduced is rolled back; an operator's --models entry
+    never is."""
+
+    auto = True
+    usable = 15
+    budget = 10                    # 2 x 10 > 15: every swap is refused
+
+    def setUp(self):
+        # TestAutoRegister.setUp, with the budgets that make the swap
+        # window itself not fit, so check_room refuses every load.
+        self.dir = tempfile.mkdtemp(prefix="serve-auto-register-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.container = Path(self.dir) / "auto.waste"
+        self.container.write_text("not a container; the factory is fake")
+        self.made = []
+        self.engine_kwargs = {"model_path": "/fake/start.waste"}
+        self.server_kwargs = {
+            "auto_register": self.auto,
+            "engine_factory": self.make_engine,
+            "engine_kwargs": {"ram_budget_bytes": self.budget},
+            "usable_ram": self.usable,
+        }
+        ServerTestCase.setUp(self)
+
+    def load(self, model):
+        return self.post("/v1/models/load", {"model": model})
+
+    def test_the_flag_gates_path_registration(self):
+        # Gate open in this subclass, but the budget refuses the load:
+        # the override of the base class's 400-vs-200 test is that the
+        # refusal itself (507) is what the gate-open path sees, and the
+        # registry is left as it was.
+        before = dict(self.server.registry)
+        status, body = self.load_path(str(self.container))
+        self.assertEqual(status, 507)
+        self.assertEqual(self.server.registry, before)
+
+    def test_a_refused_auto_register_load_deregisters_the_id(self):
+        status, body = self.load_path(str(self.container))
+        self.assertEqual(status, 507)
+        self.assertEqual(body["error"]["type"], "insufficient_memory")
+        # The id this request introduced is gone, not parked.
+        self.assertNotIn("auto", self.server.registry)
+
+    def test_the_rolled_back_id_cannot_be_loaded_by_id_alone(self):
+        """The gate survives the refusal: step 2 must be a 404, not a
+        200 that bypasses --auto-register on the strength of a leaked
+        registry entry."""
+        self.load_path(str(self.container))              # 507
+        status, body = self.load("auto")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["param"], "model")
+
+    def test_an_operators_models_entry_survives_a_refused_load(self):
+        """Rollback is bounded to what the request introduced: a path
+        load that re-registers the operator's own --models entry does
+        not deregister it when the load is refused."""
+        self.server.registry["swap-a"] = str(self.container)
+        status, body = self.load_path(str(self.container), model="swap-a")
+        self.assertEqual(status, 507)
+        self.assertIn("swap-a", self.server.registry)
+        self.assertEqual(self.server.registry["swap-a"], str(self.container))
+
+
 # A test-only engine that turns the request-vs-swap interleaving from a
 # scheduler race into a certainty: the first acquire of its lock performs
 # the swap before the lock is granted, so the request that snapshots the

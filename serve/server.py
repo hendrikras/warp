@@ -910,6 +910,7 @@ class Handler(BaseHTTPRequestHandler):
         mid = body.get("model")
         path = body.get("path")
         self._log_model_from(body)      # 404/500 lines name the model
+        registered = None                  # set if this request adds an id
         if path is not None:
             # --auto-register: a pathname instead of (or alongside) an id.
             if not srv.auto_register:
@@ -923,11 +924,27 @@ class Handler(BaseHTTPRequestHandler):
             if mid is not None and (not isinstance(mid, str) or not mid):
                 raise api.APIError("'model' must be a non-empty string",
                                    param="model")
+            # Only an id this request introduces may be rolled back below;
+            # re-loading an operator's --models entry must never
+            # deregister it when the load is refused.
+            known_before = set(srv.registry)
             mid = srv.register_path(path, mid)   # 404 no such file / 409 id
+            if mid not in known_before:
+                registered = mid
         elif not isinstance(mid, str) or not mid:
             raise api.APIError("'model' must be a non-empty string",
                                param="model")
-        previous = srv.load_model(mid)      # raises 404 / ModelLoadError
+        try:
+            previous = srv.load_model(mid)  # raises 404 / ModelLoadError / 507
+        except BaseException:
+            # A refused load (507 check_room, ModelLoadError, anything the
+            # engine raises) must not leave the id this request just
+            # registered behind: a later load-by-id would then bypass the
+            # --auto-register gate that only the path-carrying request
+            # passed. Roll back exactly what this request added.
+            if registered is not None:
+                srv.registry.pop(registered, None)
+            raise
         self._send_json(200, {
             "object": "model.load",
             "loaded": mid,
